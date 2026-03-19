@@ -7,5 +7,5 @@ edition = "2024"
 anyhow = "1.0.102"
 cpal = "0.17.3"
 ringbuf = "0.4.8"
-symphonia = { version = "0.5.5", features = ["mp3", "flac", "aac", "vorbis"] }
+symphonia = { version = "0.5.5", features = ["mp3", "flac", "aac", "wav", "ogg"] }
 crossterm = "0.29.0"
