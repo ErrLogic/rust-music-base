@@ -7,6 +7,7 @@ use std::sync::{
 pub struct AudioControl {
     pub(crate) volume_bits: Arc<AtomicU32>,
     pub(crate) paused: Arc<AtomicBool>,
+    pub(crate) started: Arc<AtomicBool>,
 }
 
 impl AudioControl {
@@ -14,6 +15,7 @@ impl AudioControl {
         Self {
             volume_bits: Arc::new(AtomicU32::new(1.0f32.to_bits())),
             paused: Arc::new(AtomicBool::new(false)),
+            started: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -30,5 +32,17 @@ impl AudioControl {
         let current = self.volume();
         let new = (current + delta).clamp(0.05, 2.0);
         self.volume_bits.store(new.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
+
+    pub fn start(&self) {
+        self.started.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_started(&self) -> bool {
+        self.started.load(Ordering::Relaxed)
     }
 }
