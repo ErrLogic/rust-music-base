@@ -1,11 +1,16 @@
 use symphonia::core::audio::Signal;
 use crate::audio::resampler::LinearResampler;
 
+pub struct DecodeInfo {
+    pub sample_rate: u32,
+    pub total_samples: u64,
+}
+
 pub fn stream_decode<P: AsRef<std::path::Path>>(
     path: P,
     out_rate: u32,
     mut push: impl FnMut(f32),
-) -> anyhow::Result<()> {
+) -> anyhow::Result<DecodeInfo> {
     use symphonia::core::{
         audio::AudioBufferRef,
         codecs::DecoderOptions,
@@ -26,6 +31,10 @@ pub fn stream_decode<P: AsRef<std::path::Path>>(
     let mut format = probed.format;
 
     let track = format.default_track().unwrap();
+
+    // 🔥 metadata (NO CONTROL HERE)
+    let sample_rate = track.codec_params.sample_rate.unwrap_or(48000);
+    let total_samples = track.codec_params.n_frames.unwrap_or(0);
 
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())?;
@@ -65,7 +74,7 @@ pub fn stream_decode<P: AsRef<std::path::Path>>(
 
                     res_l.process(data, |s| {
                         push(s);
-                        push(s);
+                        push(s); // mono → stereo
                     });
                 } else {
                     let left = buf.chan(0);
@@ -144,5 +153,35 @@ pub fn stream_decode<P: AsRef<std::path::Path>>(
         }
     }
 
-    Ok(())
+    Ok(DecodeInfo {
+        sample_rate,
+        total_samples,
+    })
+}
+
+pub fn probe_only<P: AsRef<std::path::Path>>(
+    path: P,
+) -> anyhow::Result<DecodeInfo> {
+    use symphonia::core::{
+        formats::FormatOptions,
+        io::MediaSourceStream,
+        meta::MetadataOptions,
+        probe::Hint,
+    };
+
+    let file = std::fs::File::open(path)?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+
+    let hint = Hint::new();
+
+    let probed = symphonia::default::get_probe()
+        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())?;
+
+    let format = probed.format;
+    let track = format.default_track().unwrap();
+
+    Ok(DecodeInfo {
+        sample_rate: track.codec_params.sample_rate.unwrap_or(48000),
+        total_samples: track.codec_params.n_frames.unwrap_or(0),
+    })
 }

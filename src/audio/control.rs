@@ -1,13 +1,15 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU32, Ordering},
-};
+use std::sync::{Arc, atomic::{AtomicBool, AtomicU32, Ordering}, Mutex};
+use std::sync::atomic::AtomicU64;
 
 #[derive(Clone)]
 pub struct AudioControl {
     pub(crate) volume_bits: Arc<AtomicU32>,
     pub(crate) paused: Arc<AtomicBool>,
     pub(crate) started: Arc<AtomicBool>,
+    pub(crate) elapsed_samples: Arc<AtomicU64>,
+    pub(crate) total_samples: Arc<AtomicU64>,
+    pub(crate) sample_rate: Arc<AtomicU32>,
+    pub(crate) start_instant: Arc<Mutex<Option<std::time::Instant>>>,
 }
 
 impl AudioControl {
@@ -16,6 +18,10 @@ impl AudioControl {
             volume_bits: Arc::new(AtomicU32::new(1.0f32.to_bits())),
             paused: Arc::new(AtomicBool::new(false)),
             started: Arc::new(AtomicBool::new(false)),
+            elapsed_samples: Arc::new(AtomicU64::new(0)),
+            total_samples: Arc::new(AtomicU64::new(0)),
+            sample_rate: Arc::new(AtomicU32::new(48000)),
+            start_instant: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -44,5 +50,46 @@ impl AudioControl {
 
     pub fn is_started(&self) -> bool {
         self.started.load(Ordering::Relaxed)
+    }
+
+    pub fn elapsed(&self) -> u64 {
+        self.elapsed_samples.load(Ordering::Relaxed)
+    }
+
+    pub fn set_elapsed(&self, samples: u64) {
+        self.elapsed_samples.store(samples, Ordering::Relaxed)
+    }
+
+    pub fn reset_elapsed(&self) {
+        self.elapsed_samples.store(0, Ordering::Relaxed);
+    }
+
+    pub fn set_total_samples(&self, total: u64) {
+        self.total_samples.store(total, Ordering::Relaxed);
+    }
+
+    pub fn set_sample_rate(&self, rate: u32) {
+        self.sample_rate.store(rate, Ordering::Relaxed);
+    }
+
+    pub fn total(&self) -> u64 {
+        self.total_samples.load(Ordering::Relaxed)
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate.load(Ordering::Relaxed)
+    }
+
+    pub fn mark_started(&self) {
+        let mut t = self.start_instant.lock().unwrap();
+        *t = Some(std::time::Instant::now());
+    }
+
+    pub fn elapsed_seconds(&self) -> f32 {
+        if let Some(t) = *self.start_instant.lock().unwrap() {
+            t.elapsed().as_secs_f32()
+        } else {
+            0.0
+        }
     }
 }

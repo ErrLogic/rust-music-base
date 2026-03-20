@@ -30,24 +30,38 @@ impl AudioEngine {
         let paused_flag = audio_control.paused.clone();
         let volume_bits = audio_control.volume_bits.clone();
 
+        let started_flag = audio_control.started.clone();
+
         let stream = device.build_output_stream(
             &config,
             move |output: &mut [f32], _| {
                 // 🔥 load sekali
                 let is_paused = paused_flag.load(Ordering::Relaxed);
+                let is_started = started_flag.load(Ordering::Relaxed);
                 let vol = f32::from_bits(volume_bits.load(Ordering::Relaxed));
 
                 for frame in output.chunks_mut(channels) {
-                    for ch in frame {
-                        let mut s = if is_paused {
-                            0.0
+                    let (mut l, mut r) = (0.0, 0.0);
+
+                    if is_started && !is_paused {
+                        l = consumer.try_pop().unwrap_or(0.0);
+
+                        if channels > 1 {
+                            r = consumer.try_pop().unwrap_or(l);
                         } else {
-                            consumer.try_pop().unwrap_or(0.0)
-                        };
+                            r = l;
+                        }
 
-                        s *= vol;
+                        // 🔥 increment per FRAME (benar)
+                        audio_control.elapsed_samples.fetch_add(1, Ordering::Relaxed);
+                    }
 
-                        *ch = s;
+                    l *= vol;
+                    r *= vol;
+
+                    frame[0] = l;
+                    if channels > 1 {
+                        frame[1] = r;
                     }
                 }
             },

@@ -17,6 +17,7 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScree
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use crate::audio::control::AudioControl;
+use crate::audio::decoder::probe_only;
 use crate::playlist::{load_from_dir, Playlist};
 
 mod audio;
@@ -32,6 +33,9 @@ fn main() -> Result<()> {
 
     // 3. control
     let control = AudioControl::new();
+    control.set_elapsed(0);
+    control.set_total_samples(0);
+    control.set_sample_rate(device_rate);
 
     // 4. engine (baseline)
     let engine = AudioEngine::new(audio_device, device_rate, control.clone())?;
@@ -76,6 +80,18 @@ fn main() -> Result<()> {
                 }
             };
 
+            if let Ok(info) = probe_only(&path) {
+                control_clone.set_sample_rate(info.sample_rate);
+                let adjusted_total = if info.sample_rate > 0 {
+                    (info.total_samples as u128 * device_rate as u128 / info.sample_rate as u128) as u64
+                } else {
+                    0
+                };
+
+                control_clone.set_total_samples(adjusted_total);
+                control_clone.set_elapsed(0);
+            }
+
             // 🔥 start track
             let my_id = track_id_clone.fetch_add(1, Ordering::Relaxed) + 1;
 
@@ -83,9 +99,8 @@ fn main() -> Result<()> {
             finished_clone.store(false, Ordering::Relaxed);
 
             let _ = stream_decode(&path, device_rate, |sample| {
-                // 🔥 interrupt check
                 if track_id_clone.load(Ordering::Relaxed) != my_id {
-                    return; // stop decode
+                    return;
                 }
 
                 loop {
@@ -130,6 +145,7 @@ fn main() -> Result<()> {
                         KeyCode::Char(' ') => {
                             if !control_input.is_started() {
                                 control_input.start(); // 🔥 start pertama kali
+                                control_input.mark_started();
                             } else {
                                 control_input.toggle_pause();
                             }
@@ -148,6 +164,8 @@ fn main() -> Result<()> {
                                 let mut pl = playlist_input.lock().unwrap();
                                 pl.next();
                             }
+                            control_input.reset_elapsed();
+                            control_input.set_total_samples(0);
                             finished_clone.store(false, Ordering::Relaxed);
                             track_id_clone.fetch_add(1, Ordering::Relaxed);
                         }
@@ -157,6 +175,8 @@ fn main() -> Result<()> {
                                 let mut pl = playlist_input.lock().unwrap();
                                 pl.prev();
                             }
+                            control_input.reset_elapsed();
+                            control_input.set_total_samples(0);
                             finished_clone.store(false, Ordering::Relaxed);
                             track_id_clone.fetch_add(1, Ordering::Relaxed);
                         }
@@ -191,9 +211,14 @@ fn main() -> Result<()> {
                             finished_clone.store(false, Ordering::Relaxed);
                             track_id_clone.fetch_add(1, Ordering::Relaxed);
 
+                            control_input.reset_elapsed();
+                            control_input.set_total_samples(0);
+
                             if !control_input.is_started() {
                                 control_input.start();
                             }
+
+                            control_input.mark_started();
                         },
 
                         KeyCode::Char('f') => {
