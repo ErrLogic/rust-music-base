@@ -37,7 +37,7 @@ struct AppContext {
     playlist: Arc<Mutex<Playlist>>,
     selected: Arc<AtomicUsize>,
     control: AudioControl,
-    producer: Arc<Mutex<HeapProd<f32>>>,  // Wrap in Mutex for thread safety
+    producer: Arc<Mutex<HeapProd<f32>>>,
     device_rate: u32,
 }
 
@@ -67,7 +67,7 @@ fn main() -> Result<()> {
         device_rate,
     });
 
-    // Load saved state
+    // Load saved state - this sets the seek position internally
     load_saved_state(&context);
 
     // Start decoder thread
@@ -86,37 +86,35 @@ fn main() -> Result<()> {
 }
 
 fn load_saved_state(ctx: &Arc<AppContext>) {
-    if let Some(state) = load_state() {
-        ctx.control.set_volume(state.volume);
+    let state = match load_state() {
+        Some(s) => s,
+        None => return,
+    };
 
-        if let Ok(mut pl) = ctx.playlist.lock() {
-            if let Some(path) = state.track_path {
-                if pl.set_by_path(&path) {
-                    if let Some(current_path) = pl.current() {
-                        update_track_metadata(ctx, &current_path);
+    // Set volume
+    ctx.control.set_volume(state.volume);
 
-                        let total = ctx.control.total();
-                        let seek_pos = if total > 0 && state.elapsed < total {
-                            state.elapsed
-                        } else {
-                            0
-                        };
+    // Try to find and set the saved track
+    if let Ok(mut pl) = ctx.playlist.lock() {
+        if let Some(path) = state.track_path {
+            if pl.set_by_path(&path) {
+                // Track found, load metadata
+                if let Some(current_path) = pl.current() {
+                    update_track_metadata(ctx, &current_path);
 
-                        ctx.control.set_elapsed(seek_pos);
-                        ctx.control.request_seek(seek_pos);
-                    }
-                } else {
-                    pl.current = 0;
-                    if let Some(path) = pl.current() {
-                        update_track_metadata(ctx, &path);
+                    let total = ctx.control.total();
+                    if total > 0 && state.elapsed < total {
+                        // CRITICAL: Request seek to saved position
+                        // This will be picked up by decoder thread when playback starts
+                        ctx.control.request_seek(state.elapsed);
                     }
                 }
-            }
-        }
-    } else {
-        if let Ok(pl) = ctx.playlist.lock() {
-            if let Some(path) = pl.current() {
-                update_track_metadata(ctx, &path);
+            } else {
+                // Track not found, start from first
+                pl.current = 0;
+                if let Some(path) = pl.current() {
+                    update_track_metadata(ctx, &path);
+                }
             }
         }
     }
@@ -168,22 +166,22 @@ fn start_decoder_thread(ctx: Arc<AppContext>) {
                 // Update metadata for UI
                 update_track_metadata(&ctx, &path);
 
-                // Reset elapsed
+                // Get seek position (this will get the saved position if any)
                 let seek = ctx.control.take_seek().unwrap_or(0);
+
+                // Update elapsed for UI
                 ctx.control.set_elapsed(seek);
 
-                // Decode and stream
+                // Decode and stream from seek position
                 let _ = stream_decode_with_seek(
                     &path,
                     ctx.device_rate,
                     seek,
                     |sample| {
-                        // Check if track changed during playback
                         if ctx.track_version.load(Ordering::Relaxed) != current_track_version {
                             return;
                         }
 
-                        // Push to audio buffer
                         if let Ok(mut producer) = ctx.producer.lock() {
                             loop {
                                 if producer.try_push(sample).is_ok() {
@@ -201,7 +199,6 @@ fn start_decoder_thread(ctx: Arc<AppContext>) {
                         pl.next();
                         ctx.track_version.fetch_add(1, Ordering::Relaxed);
 
-                        // Update metadata for next track immediately
                         if let Some(next_path) = pl.current() {
                             update_track_metadata(&ctx, &next_path);
                         }
@@ -253,15 +250,12 @@ fn run_ui(ctx: Arc<AppContext>) -> Result<()> {
 
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
-    // Input handling thread
     let ctx_input = ctx.clone();
     let input_handle = thread::spawn(move || {
         handle_input(ctx_input);
     });
 
-    // Main UI loop
     while ctx.running.load(Ordering::Relaxed) {
-        // Update selected index if follow mode is on
         if ctx.follow.load(Ordering::Relaxed) {
             if let Ok(pl) = ctx.playlist.lock() {
                 ctx.selected.store(pl.current, Ordering::Relaxed);
@@ -301,7 +295,7 @@ fn handle_input(ctx: Arc<AppContext>) {
                     KeyCode::Left => prev_track(&ctx),
                     KeyCode::Up => move_selection(&ctx, -1),
                     KeyCode::Down => move_selection(&ctx, 1),
-                    KeyCode::Enter => select_current_track(&ctx),
+                    KeyCode::Enter => select_track(&ctx),
                     KeyCode::Char('+') | KeyCode::Char('=') => ctx.control.adjust_volume(0.05),
                     KeyCode::Char('-') => ctx.control.adjust_volume(-0.05),
                     KeyCode::Char('f') => toggle_follow(&ctx),
@@ -320,12 +314,13 @@ fn handle_input(ctx: Arc<AppContext>) {
 
 fn toggle_playback(ctx: &Arc<AppContext>) {
     if !ctx.control.is_started() {
-        // Start playback
+        // Start playback - decoder thread will pick up any pending seek
         if let Ok(pl) = ctx.playlist.lock() {
             if let Some(path) = pl.current() {
                 update_track_metadata(ctx, &path);
-                ctx.control.reset_for_new_track();
+                // Don't reset track version yet - let decoder thread handle it
                 ctx.control.start();
+                // Force track version increment to trigger decoder thread
                 ctx.track_version.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -361,19 +356,7 @@ fn prev_track(ctx: &Arc<AppContext>) {
     save_current_state(ctx);
 }
 
-fn move_selection(ctx: &Arc<AppContext>, delta: i32) {
-    let current = ctx.selected.load(Ordering::Relaxed);
-    let new_sel = (current as i32 + delta).max(0);
-
-    if let Ok(pl) = ctx.playlist.lock() {
-        if (new_sel as usize) < pl.tracks.len() {
-            ctx.selected.store(new_sel as usize, Ordering::Relaxed);
-        }
-    }
-    ctx.follow.store(false, Ordering::Relaxed);
-}
-
-fn select_current_track(ctx: &Arc<AppContext>) {
+fn select_track(ctx: &Arc<AppContext>) {
     let selected_idx = ctx.selected.load(Ordering::Relaxed);
 
     if let Ok(mut pl) = ctx.playlist.lock() {
@@ -389,7 +372,25 @@ fn select_current_track(ctx: &Arc<AppContext>) {
     ctx.control.reset_for_new_track();
     ctx.control.set_elapsed(0);
     ctx.track_version.fetch_add(1, Ordering::Relaxed);
+
+    // Auto-start playback when selecting track with Enter
+    if !ctx.control.is_started() {
+        ctx.control.start();
+    }
+
     save_current_state(ctx);
+}
+
+fn move_selection(ctx: &Arc<AppContext>, delta: i32) {
+    let current = ctx.selected.load(Ordering::Relaxed);
+    let new_sel = (current as i32 + delta).max(0);
+
+    if let Ok(pl) = ctx.playlist.lock() {
+        if (new_sel as usize) < pl.tracks.len() {
+            ctx.selected.store(new_sel as usize, Ordering::Relaxed);
+        }
+    }
+    ctx.follow.store(false, Ordering::Relaxed);
 }
 
 fn toggle_follow(ctx: &Arc<AppContext>) {
