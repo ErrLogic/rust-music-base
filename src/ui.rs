@@ -77,7 +77,8 @@ fn marquee(text: &str, width: usize, is_selected: bool) -> String {
         }
 
         if let Some(last) = LAST_MARQUEE {
-            if now.duration_since(last).as_millis() > 120 {
+            // Slower marquee (200ms instead of 120ms)
+            if now.duration_since(last).as_millis() > 200 {
                 MARQUEE_OFFSET = (MARQUEE_OFFSET + 1) % text.len();
                 LAST_MARQUEE = Some(now);
             }
@@ -182,18 +183,18 @@ pub fn draw(
 
         let icon = volume_icon(vol);
 
-        let header_right = format!("{}  {} {}%", state, icon, vol);
+        // Compact header right: remove one space
+        let header_right = format!("{} {} {}%", state, icon, vol);
 
         (name, progress, elapsed_str, total_str, header_right)
     };
 
     // =========================
-    // 🔥 PLAYER BLOCK
+    // 🔥 PLAYER BLOCK (Compact: only top/bottom borders)
     // =========================
     let player_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(GREEN))
-        .title(" Now Playing ");
+        .borders(Borders::TOP | Borders::BOTTOM)
+        .border_style(Style::default().fg(GREEN));
 
     f.render_widget(player_block.clone(), chunks[0]);
 
@@ -214,7 +215,7 @@ pub fn draw(
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Min(1),
-            Constraint::Length(20),
+            Constraint::Length(14), // Smaller width for header right
         ])
         .split(top[0]);
 
@@ -235,7 +236,7 @@ pub fn draw(
     );
 
     // =========================
-    // 🔥 PROGRESS (Better - with bold and custom block characters)
+    // 🔥 PROGRESS
     // =========================
     let progress_layout = Layout::default()
         .direction(Direction::Horizontal)
@@ -245,24 +246,22 @@ pub fn draw(
         ])
         .split(top[1]);
 
-    // Custom progress bar using ASCII block characters that work everywhere
     let bar_width = progress_layout[0].width as usize;
     let filled = (progress * bar_width as f64) as usize;
 
-    // Use characters that work in all terminals
-    let filled_char = '█';
-    let empty_char = '░';
+    // let filled_char = '█';
+    // let empty_char = '░';
 
-    // Build bar as vector of spans to avoid string slicing issues
+    let filled_char = '●';
+    let empty_char = '•';
+
     let mut spans = Vec::new();
 
-    // Add filled part
     if filled > 0 {
         let filled_str: String = std::iter::repeat(filled_char).take(filled).collect();
         spans.push(Span::styled(filled_str, Style::default().fg(GREEN).add_modifier(Modifier::BOLD)));
     }
 
-    // Add empty part
     if bar_width > filled {
         let empty_str: String = std::iter::repeat(empty_char).take(bar_width - filled).collect();
         spans.push(Span::styled(empty_str, Style::default().fg(FG_SOFT)));
@@ -279,7 +278,7 @@ pub fn draw(
     );
 
     // =========================
-    // 🔥 PLAYLIST (with Track Count)
+    // 🔥 PLAYLIST (Compact: no "Songs" title, only track count)
     // =========================
     let (tracks, current) = {
         let pl = playlist.lock().unwrap();
@@ -288,9 +287,6 @@ pub fn draw(
 
     let selected_val = selected.load(Ordering::Relaxed);
     let width = chunks[1].width as usize - 4;
-
-    let track_count = tracks.len();
-    let playlist_title = format!(" Songs ({}) ", track_count);
 
     let items: Vec<ListItem> = tracks
         .iter()
@@ -306,15 +302,16 @@ pub fn draw(
             };
 
             if i == current {
+                // No play symbol, just bold text
                 let display_text = format!("▶ {}", text);
                 ListItem::new(display_text)
                     .style(Style::default().fg(FG_SOFT).add_modifier(Modifier::BOLD))
             } else if is_selected {
-                let display_text = format!("  {}", text);
+                let display_text = format!("{}", text);
                 ListItem::new(display_text)
                     .style(Style::default().fg(GREEN))
             } else {
-                let display_text = format!("  {}", text);
+                let display_text = format!("{}", text);
                 ListItem::new(display_text)
                     .style(Style::default().fg(FG_SOFT))
             }
@@ -324,8 +321,7 @@ pub fn draw(
     let list = List::new(items)
         .block(
             Block::default()
-                .title(playlist_title)
-                .borders(Borders::ALL)
+                .borders(Borders::TOP | Borders::BOTTOM) // Only top/bottom borders
                 .border_style(Style::default().fg(GREEN)),
         )
         .highlight_style(Style::default().fg(GREEN))
