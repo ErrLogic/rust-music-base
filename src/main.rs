@@ -161,11 +161,23 @@ fn start_decoder_thread(ctx: Arc<AppContext>) {
                         }
 
                         if let Ok(mut producer) = ctx.producer.lock() {
+                            let mut spin = 0;
+
                             loop {
                                 if producer.try_push(sample).is_ok() {
                                     break;
                                 }
-                                thread::yield_now();
+
+                                spin += 1;
+
+                                if spin < 10 {
+                                    std::hint::spin_loop(); // super ringan
+                                } else if spin < 20 {
+                                    thread::yield_now(); // kasih kesempatan thread lain
+                                } else {
+                                    thread::sleep(Duration::from_micros(200)); // 🔥 kunci hemat CPU
+                                    spin = 0;
+                                }
                             }
                         }
                     },
@@ -183,7 +195,7 @@ fn start_decoder_thread(ctx: Arc<AppContext>) {
                 }
             }
 
-            thread::sleep(Duration::from_millis(10));
+            thread::sleep(Duration::from_millis(2));
         }
     });
 }
