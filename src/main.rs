@@ -171,11 +171,11 @@ fn start_decoder_thread(ctx: Arc<AppContext>) {
                                 spin += 1;
 
                                 if spin < 10 {
-                                    std::hint::spin_loop(); // super ringan
+                                    std::hint::spin_loop();
                                 } else if spin < 20 {
-                                    thread::yield_now(); // kasih kesempatan thread lain
+                                    thread::yield_now();
                                 } else {
-                                    thread::sleep(Duration::from_micros(200)); // 🔥 kunci hemat CPU
+                                    thread::sleep(Duration::from_micros(200));
                                     spin = 0;
                                 }
                             }
@@ -326,6 +326,14 @@ fn next_track(ctx: &Arc<AppContext>) {
     ctx.control.reset_for_new_track();
     ctx.control.set_elapsed(0);
     ctx.track_version.fetch_add(1, Ordering::Relaxed);
+
+    // If follow mode is ON, update selected to match current track
+    if ctx.follow.load(Ordering::Relaxed) {
+        if let Ok(pl) = ctx.playlist.lock() {
+            ctx.selected.store(pl.current, Ordering::Relaxed);
+        }
+    }
+
     save_current_state(ctx);
 }
 
@@ -339,6 +347,14 @@ fn prev_track(ctx: &Arc<AppContext>) {
     ctx.control.reset_for_new_track();
     ctx.control.set_elapsed(0);
     ctx.track_version.fetch_add(1, Ordering::Relaxed);
+
+    // If follow mode is ON, update selected to match current track
+    if ctx.follow.load(Ordering::Relaxed) {
+        if let Ok(pl) = ctx.playlist.lock() {
+            ctx.selected.store(pl.current, Ordering::Relaxed);
+        }
+    }
+
     save_current_state(ctx);
 }
 
@@ -368,19 +384,27 @@ fn select_track(ctx: &Arc<AppContext>) {
 
 fn move_selection(ctx: &Arc<AppContext>, delta: i32) {
     let current = ctx.selected.load(Ordering::Relaxed);
-    let new_sel = (current as i32 + delta).max(0);
+    let new_sel = (current as i32 + delta).max(0) as usize;
 
     if let Ok(pl) = ctx.playlist.lock() {
-        if (new_sel as usize) < pl.tracks.len() {
-            ctx.selected.store(new_sel as usize, Ordering::Relaxed);
+        if new_sel < pl.tracks.len() {
+            ctx.selected.store(new_sel, Ordering::Relaxed);
         }
     }
+    // Turn off follow mode when user manually moves selection
     ctx.follow.store(false, Ordering::Relaxed);
 }
 
 fn toggle_follow(ctx: &Arc<AppContext>) {
     let current = ctx.follow.load(Ordering::Relaxed);
     ctx.follow.store(!current, Ordering::Relaxed);
+
+    // When turning follow mode ON, immediately sync selected to current track
+    if !current {
+        if let Ok(pl) = ctx.playlist.lock() {
+            ctx.selected.store(pl.current, Ordering::Relaxed);
+        }
+    }
 }
 
 fn seek_forward(ctx: &Arc<AppContext>) {

@@ -1,15 +1,15 @@
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, List, ListItem, Paragraph, Gauge, ListState},
-    style::{Style, Modifier, Color},
+    style::{Color, Modifier, Style},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
 
-use crate::playlist::Playlist;
 use crate::audio::control::AudioControl;
+use crate::playlist::Playlist;
 
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 // =========================
 // 🔥 GLOBAL STATE
@@ -19,13 +19,13 @@ static mut LAST_FRAME: Option<Instant> = None;
 
 static mut MARQUEE_OFFSET: usize = 0;
 static mut LAST_MARQUEE: Option<Instant> = None;
+static mut MARQUEE_PAUSED: bool = false;
+static mut MARQUEE_PAUSE_UNTIL: Option<Instant> = None;
 
 // =========================
 // 🔥 THEME
 // =========================
 const GREEN: Color = Color::Rgb(30, 215, 96);
-const GREEN_LIGHT: Color = Color::Rgb(120, 255, 180);
-const BG_DIM: Color = Color::Rgb(40, 40, 40);
 const FG_SOFT: Color = Color::Gray;
 
 // =========================
@@ -49,13 +49,32 @@ fn truncate(text: &str, width: usize) -> String {
     format!("{}...", &text[..width - 3])
 }
 
-fn marquee(text: &str, width: usize) -> String {
+fn marquee(text: &str, width: usize, is_selected: bool) -> String {
     if text.len() <= width {
         return text.to_string();
     }
 
     unsafe {
         let now = Instant::now();
+
+        // Pause marquee for 2 seconds when selected (for better readability)
+        if is_selected {
+            if let Some(pause_until) = MARQUEE_PAUSE_UNTIL {
+                if now < pause_until {
+                    return truncate(text, width);
+                } else {
+                    MARQUEE_PAUSED = false;
+                    MARQUEE_PAUSE_UNTIL = None;
+                }
+            } else if !MARQUEE_PAUSED {
+                MARQUEE_PAUSED = true;
+                MARQUEE_PAUSE_UNTIL = Some(now + Duration::from_secs(2));
+                return truncate(text, width);
+            }
+        } else {
+            MARQUEE_PAUSED = false;
+            MARQUEE_PAUSE_UNTIL = None;
+        }
 
         if let Some(last) = LAST_MARQUEE {
             if now.duration_since(last).as_millis() > 120 {
@@ -200,7 +219,7 @@ pub fn draw(
         .split(top[0]);
 
     let title_width = header[0].width as usize;
-    let title = marquee(&title_raw, title_width);
+    let title = marquee(&title_raw, title_width, false);
 
     f.render_widget(
         Paragraph::new(title)
@@ -216,7 +235,7 @@ pub fn draw(
     );
 
     // =========================
-    // 🔥 PROGRESS
+    // 🔥 PROGRESS (Better - with bold and custom block characters)
     // =========================
     let progress_layout = Layout::default()
         .direction(Direction::Horizontal)
@@ -226,17 +245,31 @@ pub fn draw(
         ])
         .split(top[1]);
 
-    let gauge = Gauge::default()
-        .ratio(progress.clamp(0.0, 1.0))
-        .use_unicode(false)
-        .gauge_style(
-            Style::default()
-                .fg(GREEN)
-                .bg(BG_DIM),
-        )
-        .label("");
+    // Custom progress bar using ASCII block characters that work everywhere
+    let bar_width = progress_layout[0].width as usize;
+    let filled = (progress * bar_width as f64) as usize;
 
-    f.render_widget(gauge, progress_layout[0]);
+    // Use characters that work in all terminals
+    let filled_char = '█';
+    let empty_char = '░';
+
+    // Build bar as vector of spans to avoid string slicing issues
+    let mut spans = Vec::new();
+
+    // Add filled part
+    if filled > 0 {
+        let filled_str: String = std::iter::repeat(filled_char).take(filled).collect();
+        spans.push(Span::styled(filled_str, Style::default().fg(GREEN).add_modifier(Modifier::BOLD)));
+    }
+
+    // Add empty part
+    if bar_width > filled {
+        let empty_str: String = std::iter::repeat(empty_char).take(bar_width - filled).collect();
+        spans.push(Span::styled(empty_str, Style::default().fg(FG_SOFT)));
+    }
+
+    let bar_paragraph = Paragraph::new(Line::from(spans));
+    f.render_widget(bar_paragraph, progress_layout[0]);
 
     f.render_widget(
         Paragraph::new(format!("{} / {}", elapsed_str, total_str))
@@ -246,7 +279,7 @@ pub fn draw(
     );
 
     // =========================
-    // 🔥 PLAYLIST
+    // 🔥 PLAYLIST (with Track Count)
     // =========================
     let (tracks, current) = {
         let pl = playlist.lock().unwrap();
@@ -256,23 +289,33 @@ pub fn draw(
     let selected_val = selected.load(Ordering::Relaxed);
     let width = chunks[1].width as usize - 4;
 
+    let track_count = tracks.len();
+    let playlist_title = format!(" Songs ({}) ", track_count);
+
     let items: Vec<ListItem> = tracks
         .iter()
         .enumerate()
         .map(|(i, t)| {
             let raw = display_name(t);
+            let is_selected = i == selected_val;
 
-            let text = if i == selected_val {
-                marquee(&raw, width)
+            let text = if is_selected {
+                marquee(&raw, width, true)
             } else {
                 truncate(&raw, width)
             };
 
             if i == current {
-                ListItem::new(format!("▶ {}", text))
-                    .style(Style::default().fg(GREEN).add_modifier(Modifier::BOLD))
+                let display_text = format!("▶ {}", text);
+                ListItem::new(display_text)
+                    .style(Style::default().fg(FG_SOFT).add_modifier(Modifier::BOLD))
+            } else if is_selected {
+                let display_text = format!("  {}", text);
+                ListItem::new(display_text)
+                    .style(Style::default().fg(GREEN))
             } else {
-                ListItem::new(format!("  {}", text))
+                let display_text = format!("  {}", text);
+                ListItem::new(display_text)
                     .style(Style::default().fg(FG_SOFT))
             }
         })
@@ -281,16 +324,12 @@ pub fn draw(
     let list = List::new(items)
         .block(
             Block::default()
-                .title(" Songs ")
+                .title(playlist_title)
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(GREEN)),
         )
-        .highlight_style(
-            Style::default()
-                .fg(GREEN_LIGHT)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol(" ");
+        .highlight_style(Style::default().fg(GREEN))
+        .highlight_symbol("");
 
     let mut state = ListState::default();
     state.select(Some(selected_val));
