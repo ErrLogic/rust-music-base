@@ -29,40 +29,31 @@ impl AudioEngine {
 
         let paused_flag = audio_control.paused.clone();
         let volume_bits = audio_control.volume_bits.clone();
-
         let started_flag = audio_control.started.clone();
+        let elapsed_samples = audio_control.elapsed_samples.clone();
 
         let stream = device.build_output_stream(
             &config,
             move |output: &mut [f32], _| {
-                // 🔥 load sekali
                 let is_paused = paused_flag.load(Ordering::Relaxed);
                 let is_started = started_flag.load(Ordering::Relaxed);
                 let vol = f32::from_bits(volume_bits.load(Ordering::Relaxed));
 
+                let mut frames_played = 0;
+
                 for frame in output.chunks_mut(channels) {
                     let (mut l, mut r) = (0.0, 0.0);
-
-                    let mut has_audio = false;
 
                     if is_started && !is_paused {
                         if let Some(sample_l) = consumer.try_pop() {
                             l = sample_l;
-                            has_audio = true;
+                            frames_played += 1;
 
                             if channels > 1 {
                                 r = consumer.try_pop().unwrap_or(l);
                             } else {
                                 r = l;
                             }
-                        } else {
-                            l = 0.0;
-                            r = 0.0;
-                        }
-
-                        // 🔥 ONLY increment kalau ada audio real
-                        if has_audio {
-                            audio_control.elapsed_samples.fetch_add(1, Ordering::Relaxed);
                         }
                     }
 
@@ -73,6 +64,10 @@ impl AudioEngine {
                     if channels > 1 {
                         frame[1] = r;
                     }
+                }
+
+                if frames_played > 0 {
+                    elapsed_samples.fetch_add(frames_played as u64, Ordering::Relaxed);
                 }
             },
             move |err| {

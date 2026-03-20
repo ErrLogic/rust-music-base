@@ -22,14 +22,12 @@ impl Default for AppState {
 }
 
 pub fn load_state() -> Option<AppState> {
-    // Check if file exists first
     if !Path::new(STATE_FILE).exists() {
         return None;
     }
 
     match fs::read_to_string(STATE_FILE) {
         Ok(data) => {
-            // Specify the type explicitly
             match serde_json::from_str::<AppState>(&data) {
                 Ok(state) => Some(state),
                 Err(_) => None,

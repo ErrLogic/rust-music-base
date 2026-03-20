@@ -1,16 +1,15 @@
 use anyhow::Result;
 use std::io::stdout;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use audio::device::{get_device_sample_rate, get_output_device};
 use audio::engine::AudioEngine;
 
-use std::thread;
-use std::time::Duration;
-
 use crate::audio::control::AudioControl;
-use crate::audio::decoder::{probe_only, stream_decode_with_seek};
+use crate::audio::decoder::stream_decode_with_seek;
 use crate::playlist::{load_from_dir, Playlist};
 use crate::state::{load_state, save_state, AppState};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -20,6 +19,7 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ringbuf::HeapProd;
 use ringbuf::producer::Producer;
 
 mod audio;
@@ -28,66 +28,17 @@ mod ui;
 mod state;
 
 // =========================
-// 🔧 SAFE LOCK HELPERS
+// 🔧 GLOBAL STATE
 // =========================
-fn lock_playlist(playlist: &'_ Arc<Mutex<Playlist>>) -> Option<MutexGuard<'_, Playlist>> {
-    match playlist.lock() {
-        Ok(guard) => Some(guard),
-        Err(poisoned) => {
-            Some(poisoned.into_inner())
-        }
-    }
-}
-
-fn lock_selected(selected: &'_ Arc<Mutex<usize>>) -> Option<MutexGuard<'_, usize>> {
-    match selected.lock() {
-        Ok(guard) => Some(guard),
-        Err(poisoned) => {
-            Some(poisoned.into_inner())
-        }
-    }
-}
-
-// =========================
-// 🔧 METADATA
-// =========================
-fn apply_track_metadata(control: &AudioControl, path: &str, device_rate: u32) {
-    if let Ok(info) = probe_only(path) {
-        control.set_sample_rate(info.sample_rate);
-
-        let adjusted_total = if info.sample_rate > 0 {
-            (info.total_samples as u128 * device_rate as u128
-                / info.sample_rate as u128) as u64
-        } else {
-            0
-        };
-
-        control.set_total_samples(adjusted_total);
-    }
-}
-
-// =========================
-// 🔧 SAVE STATE HELPER
-// =========================
-fn save_current_state(playlist: &Arc<Mutex<Playlist>>, control: &AudioControl) {
-    if let Some(pl) = lock_playlist(playlist) {
-        let current_elapsed = control.elapsed();
-        let total_samples = control.total();
-
-        let valid_elapsed = if total_samples > 0 && current_elapsed >= total_samples {
-            total_samples.saturating_sub(1)
-        } else {
-            current_elapsed
-        };
-
-        let state = AppState {
-            track_path: pl.current(),
-            elapsed: valid_elapsed,
-            volume: control.volume(),
-        };
-
-        let _ = save_state(&state);
-    }
+struct AppContext {
+    running: Arc<AtomicBool>,
+    track_version: Arc<AtomicU64>,
+    follow: Arc<AtomicBool>,
+    playlist: Arc<Mutex<Playlist>>,
+    selected: Arc<AtomicUsize>,
+    control: AudioControl,
+    producer: Arc<Mutex<HeapProd<f32>>>,  // Wrap in Mutex for thread safety
+    device_rate: u32,
 }
 
 fn main() -> Result<()> {
@@ -98,344 +49,367 @@ fn main() -> Result<()> {
     control.set_sample_rate(device_rate);
 
     let engine = AudioEngine::new(audio_device, device_rate, control.clone())?;
-    let mut producer = engine.producer;
-
-    let running = Arc::new(AtomicBool::new(true));
-    let track_id = Arc::new(AtomicU64::new(0));
-    let finished_flag = Arc::new(AtomicBool::new(false));
-    let follow = Arc::new(AtomicBool::new(true));
+    let producer = Arc::new(Mutex::new(engine.producer));
 
     let tracks = load_from_dir("songs");
     if tracks.is_empty() {
         return Ok(());
     }
 
-    let playlist = Arc::new(Mutex::new(Playlist::new(tracks)));
-    let selected = Arc::new(Mutex::new(0usize));
+    let context = Arc::new(AppContext {
+        running: Arc::new(AtomicBool::new(true)),
+        track_version: Arc::new(AtomicU64::new(0)),
+        follow: Arc::new(AtomicBool::new(true)),
+        playlist: Arc::new(Mutex::new(Playlist::new(tracks))),
+        selected: Arc::new(AtomicUsize::new(0)),
+        control,
+        producer,
+        device_rate,
+    });
 
-    // =========================
-    // 🔥 LOAD STATE
-    // =========================
+    // Load saved state
+    load_saved_state(&context);
+
+    // Start decoder thread
+    start_decoder_thread(context.clone());
+
+    // Start auto-save thread
+    start_auto_save_thread(context.clone());
+
+    // Start UI
+    run_ui(context.clone())?;
+
+    // Final save
+    save_current_state(&context);
+
+    Ok(())
+}
+
+fn load_saved_state(ctx: &Arc<AppContext>) {
     if let Some(state) = load_state() {
-        // Set volume first
-        control.set_volume(state.volume);
+        ctx.control.set_volume(state.volume);
 
-        if let Some(mut pl) = lock_playlist(&playlist) {
+        if let Ok(mut pl) = ctx.playlist.lock() {
             if let Some(path) = state.track_path {
                 if pl.set_by_path(&path) {
-                    // Track found - load metadata first
                     if let Some(current_path) = pl.current() {
-                        apply_track_metadata(&control, &current_path, device_rate);
+                        update_track_metadata(ctx, &current_path);
 
-                        // Validate seek position
-                        let total_samples = control.total();
-                        let seek_pos = if total_samples > 0 && state.elapsed < total_samples {
+                        let total = ctx.control.total();
+                        let seek_pos = if total > 0 && state.elapsed < total {
                             state.elapsed
-                        } else if total_samples > 0 {
-                            0
                         } else {
                             0
                         };
 
-                        // Request seek and update UI
-                        control.request_seek(seek_pos);
-                        control.set_elapsed(seek_pos);
+                        ctx.control.set_elapsed(seek_pos);
+                        ctx.control.request_seek(seek_pos);
                     }
                 } else {
-                    // Track not found - start from first track
                     pl.current = 0;
-                    if let Some(current_path) = pl.current() {
-                        apply_track_metadata(&control, &current_path, device_rate);
+                    if let Some(path) = pl.current() {
+                        update_track_metadata(ctx, &path);
                     }
-                    control.request_seek(0);
-                }
-            } else {
-                // No track path in state - just use current track
-                if let Some(current_path) = pl.current() {
-                    apply_track_metadata(&control, &current_path, device_rate);
                 }
             }
         }
     } else {
-        // No saved state - just load metadata for current track
-        if let Some(pl) = lock_playlist(&playlist) {
+        if let Ok(pl) = ctx.playlist.lock() {
             if let Some(path) = pl.current() {
-                apply_track_metadata(&control, &path, device_rate);
+                update_track_metadata(ctx, &path);
             }
         }
     }
+}
 
-    // Start playback
-    control.start();
+fn update_track_metadata(ctx: &Arc<AppContext>, path: &str) {
+    use crate::audio::decoder::probe_only;
 
-    // =========================
-    // 🔥 DECODER THREAD
-    // =========================
-    {
-        let playlist = playlist.clone();
-        let track_id = track_id.clone();
-        let finished_flag = finished_flag.clone();
-        let control = control.clone();
+    if let Ok(info) = probe_only(path) {
+        ctx.control.set_sample_rate(info.sample_rate);
 
-        thread::spawn(move || {
-            loop {
-                let path = {
-                    match lock_playlist(&playlist) {
-                        Some(pl) => match pl.current() {
-                            Some(p) => p,
-                            None => break,
-                        },
-                        None => break,
-                    }
+        let adjusted_total = if info.sample_rate > 0 {
+            (info.total_samples as u128 * ctx.device_rate as u128 / info.sample_rate as u128) as u64
+        } else {
+            0
+        };
+
+        ctx.control.set_total_samples(adjusted_total);
+    }
+}
+
+fn start_decoder_thread(ctx: Arc<AppContext>) {
+    thread::spawn(move || {
+        let mut current_track_version = 0u64;
+
+        loop {
+            // Check if we should stop
+            if !ctx.running.load(Ordering::Relaxed) {
+                break;
+            }
+
+            // Get current track path
+            let path = {
+                let pl = match ctx.playlist.lock() {
+                    Ok(p) => p,
+                    Err(_) => continue,
                 };
+                match pl.current() {
+                    Some(p) => p,
+                    None => continue,
+                }
+            };
 
-                // Update metadata for new track
-                apply_track_metadata(&control, &path, device_rate);
+            // Check if track version changed
+            let new_version = ctx.track_version.load(Ordering::Relaxed);
+            if new_version != current_track_version {
+                current_track_version = new_version;
 
-                let my_id = track_id.fetch_add(1, Ordering::Relaxed) + 1;
+                // Update metadata for UI
+                update_track_metadata(&ctx, &path);
 
-                // Get seek position (or start from 0)
-                let seek = control.take_seek().unwrap_or(0);
+                // Reset elapsed
+                let seek = ctx.control.take_seek().unwrap_or(0);
+                ctx.control.set_elapsed(seek);
 
-                // Update elapsed to match seek position
-                control.set_elapsed(seek);
-
+                // Decode and stream
                 let _ = stream_decode_with_seek(
                     &path,
-                    device_rate,
+                    ctx.device_rate,
                     seek,
                     |sample| {
-                        if track_id.load(Ordering::Relaxed) != my_id {
+                        // Check if track changed during playback
+                        if ctx.track_version.load(Ordering::Relaxed) != current_track_version {
                             return;
                         }
 
-                        loop {
-                            if producer.try_push(sample).is_ok() {
-                                break;
+                        // Push to audio buffer
+                        if let Ok(mut producer) = ctx.producer.lock() {
+                            loop {
+                                if producer.try_push(sample).is_ok() {
+                                    break;
+                                }
+                                thread::yield_now();
                             }
-                            thread::yield_now();
                         }
                     },
                 );
 
-                if track_id.load(Ordering::Relaxed) == my_id {
-                    finished_flag.store(true, Ordering::Relaxed);
-                }
-
-                if finished_flag.load(Ordering::Relaxed) {
-                    if let Some(mut pl) = lock_playlist(&playlist) {
+                // Move to next track only if this track completed naturally
+                if ctx.track_version.load(Ordering::Relaxed) == current_track_version {
+                    if let Ok(mut pl) = ctx.playlist.lock() {
                         pl.next();
-                    }
-                    finished_flag.store(false, Ordering::Relaxed);
-                }
-            }
-        });
-    }
+                        ctx.track_version.fetch_add(1, Ordering::Relaxed);
 
-    // =========================
-    // 🔥 AUTO SAVE (IMPROVED - SAVE EVERY 2 SECONDS)
-    // =========================
-    {
-        let playlist = playlist.clone();
-        let control = control.clone();
-
-        thread::spawn(move || {
-            loop {
-                thread::sleep(Duration::from_secs(2));
-                save_current_state(&playlist, &control);
-            }
-        });
-    }
-
-    // =========================
-    // 🔥 INPUT THREAD
-    // =========================
-    {
-        let running = running.clone();
-        let track_id = track_id.clone();
-        let control = control.clone();
-        let playlist = playlist.clone();
-        let selected = selected.clone();
-        let follow = follow.clone();
-
-        thread::spawn(move || {
-            loop {
-                if let Ok(true) = event::poll(Duration::from_millis(50)) {
-                    if let Ok(Event::Key(key)) = event::read() {
-                        if key.kind != KeyEventKind::Press {
-                            continue;
-                        }
-
-                        match key.code {
-                            KeyCode::Char(' ') => {
-                                if !control.is_started() {
-                                    if let Some(pl) = lock_playlist(&playlist) {
-                                        if let Some(path) = pl.current() {
-                                            control.reset_for_new_track();
-                                            apply_track_metadata(&control, &path, device_rate);
-                                        }
-                                    }
-                                    control.start();
-                                } else {
-                                    control.toggle_pause();
-                                }
-                                // Save state after pause/unpause
-                                save_current_state(&playlist, &control);
-                            }
-
-                            KeyCode::Right => {
-                                if let Some(mut pl) = lock_playlist(&playlist) {
-                                    pl.next();
-                                }
-                                // Update metadata for new track
-                                if let Some(pl) = lock_playlist(&playlist) {
-                                    if let Some(path) = pl.current() {
-                                        apply_track_metadata(&control, &path, device_rate);
-                                    }
-                                }
-                                control.reset_for_new_track();
-                                track_id.fetch_add(1, Ordering::Relaxed);
-                                // Save state after track change
-                                save_current_state(&playlist, &control);
-                            }
-
-                            KeyCode::Left => {
-                                if let Some(mut pl) = lock_playlist(&playlist) {
-                                    pl.prev();
-                                }
-                                // Update metadata for new track
-                                if let Some(pl) = lock_playlist(&playlist) {
-                                    if let Some(path) = pl.current() {
-                                        apply_track_metadata(&control, &path, device_rate);
-                                    }
-                                }
-                                control.reset_for_new_track();
-                                track_id.fetch_add(1, Ordering::Relaxed);
-                                // Save state after track change
-                                save_current_state(&playlist, &control);
-                            }
-
-                            KeyCode::Up => {
-                                if let Some(mut sel) = lock_selected(&selected) {
-                                    if *sel > 0 {
-                                        *sel -= 1;
-                                    }
-                                }
-                                follow.store(false, Ordering::Relaxed);
-                            }
-
-                            KeyCode::Down => {
-                                if let Some(mut sel) = lock_selected(&selected) {
-                                    if let Some(pl) = lock_playlist(&playlist) {
-                                        if *sel + 1 < pl.tracks.len() {
-                                            *sel += 1;
-                                        }
-                                    }
-                                }
-                                follow.store(false, Ordering::Relaxed);
-                            }
-
-                            KeyCode::Enter => {
-                                if let Some(mut pl) = lock_playlist(&playlist) {
-                                    if let Some(sel) = lock_selected(&selected) {
-                                        if *sel < pl.tracks.len() {
-                                            pl.current = *sel;
-                                        }
-                                    }
-                                }
-                                // Update metadata for selected track
-                                if let Some(pl) = lock_playlist(&playlist) {
-                                    if let Some(path) = pl.current() {
-                                        apply_track_metadata(&control, &path, device_rate);
-                                    }
-                                }
-                                follow.store(true, Ordering::Relaxed);
-                                control.reset_for_new_track();
-                                track_id.fetch_add(1, Ordering::Relaxed);
-                                // Save state after track selection
-                                save_current_state(&playlist, &control);
-                            }
-
-                            KeyCode::Char('+') | KeyCode::Char('=') => {
-                                control.adjust_volume(0.1);
-                                // Save state after volume change
-                                save_current_state(&playlist, &control);
-                            }
-
-                            KeyCode::Char('-') => {
-                                control.adjust_volume(-0.1);
-                                // Save state after volume change
-                                save_current_state(&playlist, &control);
-                            }
-
-                            KeyCode::Char('f') => {
-                                let cur = follow.load(Ordering::Relaxed);
-                                follow.store(!cur, Ordering::Relaxed);
-                            }
-
-                            KeyCode::Char('l') => {
-                                let sr = control.sample_rate() as u64;
-                                let new_pos = control.elapsed() + sr * 5;
-
-                                control.request_seek(new_pos);
-                                track_id.fetch_add(1, Ordering::Relaxed);
-                                // Save state after seek
-                                save_current_state(&playlist, &control);
-                            }
-
-                            KeyCode::Char('h') => {
-                                let sr = control.sample_rate() as u64;
-                                let cur = control.elapsed();
-
-                                let new_pos = cur.saturating_sub(sr * 5);
-
-                                control.request_seek(new_pos);
-                                track_id.fetch_add(1, Ordering::Relaxed);
-                                // Save state after seek
-                                save_current_state(&playlist, &control);
-                            }
-
-                            KeyCode::Char('q') => {
-                                // Save final state before exit
-                                save_current_state(&playlist, &control);
-                                running.store(false, Ordering::Relaxed);
-                                break;
-                            }
-
-                            _ => {}
+                        // Update metadata for next track immediately
+                        if let Some(next_path) = pl.current() {
+                            update_track_metadata(&ctx, &next_path);
                         }
                     }
                 }
             }
-        });
-    }
 
+            thread::sleep(Duration::from_millis(10));
+        }
+    });
+}
+
+fn start_auto_save_thread(ctx: Arc<AppContext>) {
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_secs(2));
+            if !ctx.running.load(Ordering::Relaxed) {
+                break;
+            }
+            save_current_state(&ctx);
+        }
+    });
+}
+
+fn save_current_state(ctx: &Arc<AppContext>) {
+    if let Ok(pl) = ctx.playlist.lock() {
+        let elapsed = ctx.control.elapsed();
+        let total = ctx.control.total();
+
+        let valid_elapsed = if total > 0 && elapsed >= total {
+            total.saturating_sub(1)
+        } else {
+            elapsed
+        };
+
+        let state = AppState {
+            track_path: pl.current(),
+            elapsed: valid_elapsed,
+            volume: ctx.control.volume(),
+        };
+
+        let _ = save_state(&state);
+    }
+}
+
+fn run_ui(ctx: Arc<AppContext>) -> Result<()> {
     enable_raw_mode()?;
     execute!(stdout(), EnterAlternateScreen)?;
 
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
-    while running.load(Ordering::Relaxed) {
-        if follow.load(Ordering::Relaxed) {
-            if let Some(pl) = lock_playlist(&playlist) {
-                let current = pl.current;
+    // Input handling thread
+    let ctx_input = ctx.clone();
+    let input_handle = thread::spawn(move || {
+        handle_input(ctx_input);
+    });
 
-                if let Some(mut sel) = lock_selected(&selected) {
-                    *sel = current;
-                }
+    // Main UI loop
+    while ctx.running.load(Ordering::Relaxed) {
+        // Update selected index if follow mode is on
+        if ctx.follow.load(Ordering::Relaxed) {
+            if let Ok(pl) = ctx.playlist.lock() {
+                ctx.selected.store(pl.current, Ordering::Relaxed);
             }
         }
 
         terminal.draw(|f| {
-            ui::draw(f, &playlist, &control, &selected);
+            ui::draw(f, &ctx.playlist, &ctx.control, &ctx.selected);
         })?;
+
+        thread::sleep(Duration::from_millis(16));
     }
 
-    // Final save before exit (redundant but safe)
-    save_current_state(&playlist, &control);
+    input_handle.join().unwrap();
 
     disable_raw_mode()?;
     execute!(stdout(), LeaveAlternateScreen)?;
 
     Ok(())
+}
+
+fn handle_input(ctx: Arc<AppContext>) {
+    loop {
+        if !ctx.running.load(Ordering::Relaxed) {
+            break;
+        }
+
+        if let Ok(true) = event::poll(Duration::from_millis(50)) {
+            if let Ok(Event::Key(key)) = event::read() {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+
+                match key.code {
+                    KeyCode::Char(' ') => toggle_playback(&ctx),
+                    KeyCode::Right => next_track(&ctx),
+                    KeyCode::Left => prev_track(&ctx),
+                    KeyCode::Up => move_selection(&ctx, -1),
+                    KeyCode::Down => move_selection(&ctx, 1),
+                    KeyCode::Enter => select_current_track(&ctx),
+                    KeyCode::Char('+') | KeyCode::Char('=') => ctx.control.adjust_volume(0.05),
+                    KeyCode::Char('-') => ctx.control.adjust_volume(-0.05),
+                    KeyCode::Char('f') => toggle_follow(&ctx),
+                    KeyCode::Char('l') => seek_forward(&ctx),
+                    KeyCode::Char('h') => seek_backward(&ctx),
+                    KeyCode::Char('q') => {
+                        ctx.running.store(false, Ordering::Relaxed);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+fn toggle_playback(ctx: &Arc<AppContext>) {
+    if !ctx.control.is_started() {
+        // Start playback
+        if let Ok(pl) = ctx.playlist.lock() {
+            if let Some(path) = pl.current() {
+                update_track_metadata(ctx, &path);
+                ctx.control.reset_for_new_track();
+                ctx.control.start();
+                ctx.track_version.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    } else {
+        ctx.control.toggle_pause();
+    }
+    save_current_state(ctx);
+}
+
+fn next_track(ctx: &Arc<AppContext>) {
+    if let Ok(mut pl) = ctx.playlist.lock() {
+        pl.next();
+        if let Some(path) = pl.current() {
+            update_track_metadata(ctx, &path);
+        }
+    }
+    ctx.control.reset_for_new_track();
+    ctx.control.set_elapsed(0);
+    ctx.track_version.fetch_add(1, Ordering::Relaxed);
+    save_current_state(ctx);
+}
+
+fn prev_track(ctx: &Arc<AppContext>) {
+    if let Ok(mut pl) = ctx.playlist.lock() {
+        pl.prev();
+        if let Some(path) = pl.current() {
+            update_track_metadata(ctx, &path);
+        }
+    }
+    ctx.control.reset_for_new_track();
+    ctx.control.set_elapsed(0);
+    ctx.track_version.fetch_add(1, Ordering::Relaxed);
+    save_current_state(ctx);
+}
+
+fn move_selection(ctx: &Arc<AppContext>, delta: i32) {
+    let current = ctx.selected.load(Ordering::Relaxed);
+    let new_sel = (current as i32 + delta).max(0);
+
+    if let Ok(pl) = ctx.playlist.lock() {
+        if (new_sel as usize) < pl.tracks.len() {
+            ctx.selected.store(new_sel as usize, Ordering::Relaxed);
+        }
+    }
+    ctx.follow.store(false, Ordering::Relaxed);
+}
+
+fn select_current_track(ctx: &Arc<AppContext>) {
+    let selected_idx = ctx.selected.load(Ordering::Relaxed);
+
+    if let Ok(mut pl) = ctx.playlist.lock() {
+        if selected_idx < pl.tracks.len() {
+            pl.current = selected_idx;
+            if let Some(path) = pl.current() {
+                update_track_metadata(ctx, &path);
+            }
+        }
+    }
+
+    ctx.follow.store(true, Ordering::Relaxed);
+    ctx.control.reset_for_new_track();
+    ctx.control.set_elapsed(0);
+    ctx.track_version.fetch_add(1, Ordering::Relaxed);
+    save_current_state(ctx);
+}
+
+fn toggle_follow(ctx: &Arc<AppContext>) {
+    let current = ctx.follow.load(Ordering::Relaxed);
+    ctx.follow.store(!current, Ordering::Relaxed);
+}
+
+fn seek_forward(ctx: &Arc<AppContext>) {
+    let sr = ctx.control.sample_rate() as u64;
+    let new_pos = ctx.control.elapsed() + sr * 5;
+    ctx.control.request_seek(new_pos);
+    ctx.track_version.fetch_add(1, Ordering::Relaxed);
+    save_current_state(ctx);
+}
+
+fn seek_backward(ctx: &Arc<AppContext>) {
+    let sr = ctx.control.sample_rate() as u64;
+    let cur = ctx.control.elapsed();
+    let new_pos = cur.saturating_sub(sr * 5);
+    ctx.control.request_seek(new_pos);
+    ctx.track_version.fetch_add(1, Ordering::Relaxed);
+    save_current_state(ctx);
 }

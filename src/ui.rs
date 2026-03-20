@@ -8,6 +8,7 @@ use crate::playlist::Playlist;
 use crate::audio::control::AudioControl;
 
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 // =========================
@@ -92,7 +93,7 @@ pub fn draw(
     f: &mut Frame,
     playlist: &Arc<Mutex<Playlist>>,
     control: &AudioControl,
-    selected: &Arc<Mutex<usize>>,
+    selected: &Arc<AtomicUsize>,
 ) {
     let size = f.area();
 
@@ -252,7 +253,7 @@ pub fn draw(
         (pl.tracks.clone(), pl.current)
     };
 
-    let selected = *selected.lock().unwrap();
+    let selected_val = selected.load(Ordering::Relaxed);
     let width = chunks[1].width as usize - 4;
 
     let items: Vec<ListItem> = tracks
@@ -261,7 +262,7 @@ pub fn draw(
         .map(|(i, t)| {
             let raw = display_name(t);
 
-            let text = if i == selected {
+            let text = if i == selected_val {
                 marquee(&raw, width)
             } else {
                 truncate(&raw, width)
@@ -292,7 +293,7 @@ pub fn draw(
         .highlight_symbol(" ");
 
     let mut state = ListState::default();
-    state.select(Some(selected));
+    state.select(Some(selected_val));
 
     f.render_stateful_widget(list, chunks[1], &mut state);
 }

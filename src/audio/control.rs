@@ -87,7 +87,6 @@ impl AudioControl {
         self.elapsed_samples.store(0, Ordering::Relaxed);
         self.total_samples.store(0, Ordering::Relaxed);
         self.paused.store(false, Ordering::Relaxed);
-
         self.seeking.store(false, Ordering::Relaxed);
         self.seek_target.store(0, Ordering::Relaxed);
     }
@@ -95,6 +94,7 @@ impl AudioControl {
     pub fn request_seek(&self, target_samples: u64) {
         self.seek_target.store(target_samples, Ordering::Relaxed);
         self.seeking.store(true, Ordering::Relaxed);
+        self.elapsed_samples.store(target_samples, Ordering::Relaxed);
     }
 
     pub fn take_seek(&self) -> Option<u64> {
