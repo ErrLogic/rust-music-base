@@ -252,8 +252,8 @@ pub fn draw(
     // let filled_char = '█';
     // let empty_char = '░';
 
-    let filled_char = '●';
-    let empty_char = '•';
+    let filled_char = '⦿';
+    let empty_char = '⦾';
 
     let mut spans = Vec::new();
 
