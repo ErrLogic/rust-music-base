@@ -43,17 +43,27 @@ impl AudioEngine {
                 for frame in output.chunks_mut(channels) {
                     let (mut l, mut r) = (0.0, 0.0);
 
-                    if is_started && !is_paused {
-                        l = consumer.try_pop().unwrap_or(0.0);
+                    let mut has_audio = false;
 
-                        if channels > 1 {
-                            r = consumer.try_pop().unwrap_or(l);
+                    if is_started && !is_paused {
+                        if let Some(sample_l) = consumer.try_pop() {
+                            l = sample_l;
+                            has_audio = true;
+
+                            if channels > 1 {
+                                r = consumer.try_pop().unwrap_or(l);
+                            } else {
+                                r = l;
+                            }
                         } else {
-                            r = l;
+                            l = 0.0;
+                            r = 0.0;
                         }
 
-                        // 🔥 increment per FRAME (benar)
-                        audio_control.elapsed_samples.fetch_add(1, Ordering::Relaxed);
+                        // 🔥 ONLY increment kalau ada audio real
+                        if has_audio {
+                            audio_control.elapsed_samples.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
 
                     l *= vol;

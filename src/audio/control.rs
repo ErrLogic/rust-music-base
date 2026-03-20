@@ -1,5 +1,5 @@
-use std::sync::{Arc, atomic::{AtomicBool, AtomicU32, Ordering}, Mutex};
 use std::sync::atomic::AtomicU64;
+use std::sync::{atomic::{AtomicBool, AtomicU32, Ordering}, Arc};
 
 #[derive(Clone)]
 pub struct AudioControl {
@@ -9,7 +9,6 @@ pub struct AudioControl {
     pub(crate) elapsed_samples: Arc<AtomicU64>,
     pub(crate) total_samples: Arc<AtomicU64>,
     pub(crate) sample_rate: Arc<AtomicU32>,
-    pub(crate) start_instant: Arc<Mutex<Option<std::time::Instant>>>,
 }
 
 impl AudioControl {
@@ -21,7 +20,6 @@ impl AudioControl {
             elapsed_samples: Arc::new(AtomicU64::new(0)),
             total_samples: Arc::new(AtomicU64::new(0)),
             sample_rate: Arc::new(AtomicU32::new(48000)),
-            start_instant: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -60,9 +58,9 @@ impl AudioControl {
         self.elapsed_samples.store(samples, Ordering::Relaxed)
     }
 
-    pub fn reset_elapsed(&self) {
-        self.elapsed_samples.store(0, Ordering::Relaxed);
-    }
+    // pub fn reset_elapsed(&self) {
+    //     self.elapsed_samples.store(0, Ordering::Relaxed);
+    // }
 
     pub fn set_total_samples(&self, total: u64) {
         self.total_samples.store(total, Ordering::Relaxed);
@@ -80,16 +78,14 @@ impl AudioControl {
         self.sample_rate.load(Ordering::Relaxed)
     }
 
-    pub fn mark_started(&self) {
-        let mut t = self.start_instant.lock().unwrap();
-        *t = Some(std::time::Instant::now());
-    }
+    pub fn reset_for_new_track(&self) {
+        self.elapsed_samples.store(0, Ordering::Relaxed);
+        self.total_samples.store(0, Ordering::Relaxed);
 
-    pub fn elapsed_seconds(&self) -> f32 {
-        if let Some(t) = *self.start_instant.lock().unwrap() {
-            t.elapsed().as_secs_f32()
-        } else {
-            0.0
-        }
+        // penting: jangan reset started
+        // karena engine butuh tetap jalan
+
+        // reset pause supaya konsisten
+        self.paused.store(false, Ordering::Relaxed);
     }
 }

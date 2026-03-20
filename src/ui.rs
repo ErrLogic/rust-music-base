@@ -47,7 +47,12 @@ pub fn draw(
         let total_samples = control.total();
         let sample_rate = control.sample_rate() as f32;
 
-        let elapsed_sec = control.elapsed_seconds();
+        let elapsed_sec = if sample_rate > 0.0 {
+            elapsed_samples as f32 / sample_rate
+        } else {
+            0.0
+        };
+        
         let total_sec = if total_samples > 0 {
             total_samples as f32 / sample_rate
         } else {

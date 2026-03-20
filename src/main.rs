@@ -2,7 +2,6 @@ use std::io::stdout;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use anyhow::Result;
-use ringbuf::producer::Producer;
 
 use audio::device::{get_output_device, get_device_sample_rate};
 use audio::engine::AudioEngine;
@@ -16,6 +15,7 @@ use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ringbuf::producer::Producer;
 use crate::audio::control::AudioControl;
 use crate::audio::decoder::probe_only;
 use crate::playlist::{load_from_dir, Playlist};
@@ -23,6 +23,20 @@ use crate::playlist::{load_from_dir, Playlist};
 mod audio;
 mod playlist;
 mod ui;
+
+fn apply_track_metadata(control: &AudioControl, path: &str, device_rate: u32) {
+    if let Ok(info) = probe_only(path) {
+        control.set_sample_rate(info.sample_rate);
+
+        let adjusted_total = if info.sample_rate > 0 {
+            (info.total_samples as u128 * device_rate as u128 / info.sample_rate as u128) as u64
+        } else {
+            0
+        };
+
+        control.set_total_samples(adjusted_total);
+    }
+}
 
 fn main() -> Result<()> {
     // 1. device
@@ -37,21 +51,19 @@ fn main() -> Result<()> {
     control.set_total_samples(0);
     control.set_sample_rate(device_rate);
 
-    // 4. engine (baseline)
+    // 4. engine
     let engine = AudioEngine::new(audio_device, device_rate, control.clone())?;
 
-    // 5. producer
     let mut producer = engine.producer;
 
-    // 6. state keeper
+    // 5. state
     let running = Arc::new(AtomicBool::new(true));
     let track_id = Arc::new(AtomicU64::new(0));
     let finished_flag = Arc::new(AtomicBool::new(false));
     let follow = Arc::new(AtomicBool::new(true));
 
-    // 7. playlist
+    // 6. playlist
     let tracks = load_from_dir("songs");
-
     if tracks.is_empty() {
         eprintln!("No audio files found in ./songs");
         return Ok(());
@@ -65,7 +77,9 @@ fn main() -> Result<()> {
     let finished_clone = finished_flag.clone();
     let control_clone = control.clone();
 
-    // 8. decoder thread (ISOLATED)
+    // =========================
+    // 🔥 DECODER THREAD
+    // =========================
     thread::spawn(move || {
         loop {
             while !control_clone.is_started() {
@@ -80,22 +94,7 @@ fn main() -> Result<()> {
                 }
             };
 
-            if let Ok(info) = probe_only(&path) {
-                control_clone.set_sample_rate(info.sample_rate);
-                let adjusted_total = if info.sample_rate > 0 {
-                    (info.total_samples as u128 * device_rate as u128 / info.sample_rate as u128) as u64
-                } else {
-                    0
-                };
-
-                control_clone.set_total_samples(adjusted_total);
-                control_clone.set_elapsed(0);
-            }
-
-            // 🔥 start track
             let my_id = track_id_clone.fetch_add(1, Ordering::Relaxed) + 1;
-
-            // reset finished untuk track ini
             finished_clone.store(false, Ordering::Relaxed);
 
             let _ = stream_decode(&path, device_rate, |sample| {
@@ -111,12 +110,10 @@ fn main() -> Result<()> {
                 }
             });
 
-            // 🔥 hanya tandai finished kalau TIDAK di-interrupt
             if track_id_clone.load(Ordering::Relaxed) == my_id {
                 finished_clone.store(true, Ordering::Relaxed);
             }
 
-            // 🔥 auto-next hanya kalau benar-benar finished
             if finished_clone.load(Ordering::Relaxed) {
                 let mut pl = playlist_clone.lock().unwrap();
                 pl.next();
@@ -132,7 +129,9 @@ fn main() -> Result<()> {
     let selected_input = selected.clone();
     let follow_input = follow.clone();
 
-    // 9. INPUT THREAD (ISOLATED)
+    // =========================
+    // 🔥 INPUT THREAD
+    // =========================
     thread::spawn(move || {
         loop {
             if event::poll(Duration::from_millis(50)).unwrap() {
@@ -144,12 +143,20 @@ fn main() -> Result<()> {
                     match key.code {
                         KeyCode::Char(' ') => {
                             if !control_input.is_started() {
-                                control_input.start(); // 🔥 start pertama kali
-                                control_input.mark_started();
+                                // 🔥 FIRST PLAY FIX
+                                if let Some(path) = {
+                                    let pl = playlist_input.lock().unwrap();
+                                    pl.current()
+                                } {
+                                    control_input.reset_for_new_track();
+                                    apply_track_metadata(&control_input, &path, device_rate);
+                                }
+
+                                control_input.start();
                             } else {
                                 control_input.toggle_pause();
                             }
-                        },
+                        }
 
                         KeyCode::Char('+') | KeyCode::Char('=') => {
                             control_input.adjust_volume(0.1)
@@ -163,9 +170,14 @@ fn main() -> Result<()> {
                             {
                                 let mut pl = playlist_input.lock().unwrap();
                                 pl.next();
+
+                                control_input.reset_for_new_track(); // 🔥 FIX ORDER
+
+                                if let Some(path) = pl.current() {
+                                    apply_track_metadata(&control_input, &path, device_rate);
+                                }
                             }
-                            control_input.reset_elapsed();
-                            control_input.set_total_samples(0);
+
                             finished_clone.store(false, Ordering::Relaxed);
                             track_id_clone.fetch_add(1, Ordering::Relaxed);
                         }
@@ -174,11 +186,39 @@ fn main() -> Result<()> {
                             {
                                 let mut pl = playlist_input.lock().unwrap();
                                 pl.prev();
+
+                                control_input.reset_for_new_track(); // 🔥 FIX ORDER
+
+                                if let Some(path) = pl.current() {
+                                    apply_track_metadata(&control_input, &path, device_rate);
+                                }
                             }
-                            control_input.reset_elapsed();
-                            control_input.set_total_samples(0);
+
                             finished_clone.store(false, Ordering::Relaxed);
                             track_id_clone.fetch_add(1, Ordering::Relaxed);
+                        }
+
+                        KeyCode::Enter => {
+                            let mut pl = playlist_input.lock().unwrap();
+                            let sel = *selected_input.lock().unwrap();
+
+                            if sel < pl.tracks.len() {
+                                pl.current = sel;
+
+                                control_input.reset_for_new_track(); // 🔥 FIX ORDER
+
+                                if let Some(path) = pl.current() {
+                                    apply_track_metadata(&control_input, &path, device_rate);
+                                }
+                            }
+
+                            follow_input.store(true, Ordering::Relaxed);
+                            finished_clone.store(false, Ordering::Relaxed);
+                            track_id_clone.fetch_add(1, Ordering::Relaxed);
+
+                            if !control_input.is_started() {
+                                control_input.start();
+                            }
                         }
 
                         KeyCode::Up => {
@@ -187,7 +227,7 @@ fn main() -> Result<()> {
                                 *sel -= 1;
                             }
                             follow_input.store(false, Ordering::Relaxed);
-                        },
+                        }
 
                         KeyCode::Down => {
                             let mut sel = selected_input.lock().unwrap();
@@ -196,35 +236,12 @@ fn main() -> Result<()> {
                                 *sel += 1;
                             }
                             follow_input.store(false, Ordering::Relaxed);
-                        },
-
-                        KeyCode::Enter => {
-                            let mut pl = playlist_input.lock().unwrap();
-                            let sel = *selected_input.lock().unwrap();
-
-                            if sel < pl.tracks.len() {
-                                pl.current = sel;
-                            }
-
-                            follow_input.store(true, Ordering::Relaxed);
-
-                            finished_clone.store(false, Ordering::Relaxed);
-                            track_id_clone.fetch_add(1, Ordering::Relaxed);
-
-                            control_input.reset_elapsed();
-                            control_input.set_total_samples(0);
-
-                            if !control_input.is_started() {
-                                control_input.start();
-                            }
-
-                            control_input.mark_started();
-                        },
+                        }
 
                         KeyCode::Char('f') => {
                             let cur = follow_input.load(Ordering::Relaxed);
                             follow_input.store(!cur, Ordering::Relaxed);
-                        },
+                        }
 
                         KeyCode::Char('q') => {
                             running_clone.store(false, Ordering::Relaxed);
@@ -243,9 +260,7 @@ fn main() -> Result<()> {
 
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
-    // 10. main loop stay alive as long state keeper is running true
     while running.load(Ordering::Relaxed) {
-        // 🔥 SYNC selected → current (kalau follow aktif)
         if follow.load(Ordering::Relaxed) {
             let current = {
                 let pl = playlist.lock().unwrap();
@@ -256,7 +271,6 @@ fn main() -> Result<()> {
             *sel = current;
         }
 
-        // 🔥 baru render
         terminal.draw(|f| {
             ui::draw(f, &playlist, &control, &selected);
         })?;
