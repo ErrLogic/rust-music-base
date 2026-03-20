@@ -36,19 +36,24 @@ pub fn stream_decode_with_seek<P: AsRef<std::path::Path>>(
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())?;
 
+    // 🔥 OPTIMIZED SEEK: Use Accurate mode for better precision
     if seek_samples > 0 && sample_rate > 0 {
         let seconds = seek_samples as f64 / sample_rate as f64;
-        let _ = format.seek(
-            SeekMode::Accurate,
-            SeekTo::Time {
-                time: Time::from(seconds),
-                track_id: Some(track.id),
-            },
-        );
+        let seek_to = SeekTo::Time {
+            time: Time::from(seconds),
+            track_id: Some(track.id),
+        };
+
+        // Use Accurate seek for better precision
+        let _ = format.seek(SeekMode::Accurate, seek_to);
     }
 
     let mut resampler_l: Option<LinearResampler> = None;
     let mut resampler_r: Option<LinearResampler> = None;
+
+    // Small buffer to reduce overhead
+    const CHUNK_SIZE: usize = 1024;
+    let mut chunk_buffer = Vec::with_capacity(CHUNK_SIZE);
 
     loop {
         let packet = match format.next_packet() {
@@ -78,8 +83,14 @@ pub fn stream_decode_with_seek<P: AsRef<std::path::Path>>(
 
                 if channels == 1 {
                     res_l.process(buf.chan(0), |s| {
-                        push(s);
-                        push(s);
+                        chunk_buffer.push(s);
+                        chunk_buffer.push(s);
+
+                        if chunk_buffer.len() >= CHUNK_SIZE {
+                            for sample in chunk_buffer.drain(..) {
+                                push(sample);
+                            }
+                        }
                     });
                 } else if let Some(res_r) = resampler_r.as_mut() {
                     let mut l = Vec::new();
@@ -89,8 +100,14 @@ pub fn stream_decode_with_seek<P: AsRef<std::path::Path>>(
                     res_r.process(buf.chan(1), |s| r.push(s));
 
                     for i in 0..l.len().min(r.len()) {
-                        push(l[i]);
-                        push(r[i]);
+                        chunk_buffer.push(l[i]);
+                        chunk_buffer.push(r[i]);
+
+                        if chunk_buffer.len() >= CHUNK_SIZE {
+                            for sample in chunk_buffer.drain(..) {
+                                push(sample);
+                            }
+                        }
                     }
                 }
             }
@@ -117,8 +134,14 @@ pub fn stream_decode_with_seek<P: AsRef<std::path::Path>>(
                         .collect();
 
                     res_l.process(&data, |s| {
-                        push(s);
-                        push(s);
+                        chunk_buffer.push(s);
+                        chunk_buffer.push(s);
+
+                        if chunk_buffer.len() >= CHUNK_SIZE {
+                            for sample in chunk_buffer.drain(..) {
+                                push(sample);
+                            }
+                        }
                     });
                 } else if let Some(res_r) = resampler_r.as_mut() {
                     let left: Vec<f32> = buf
@@ -140,14 +163,25 @@ pub fn stream_decode_with_seek<P: AsRef<std::path::Path>>(
                     res_r.process(&right, |s| temp_r.push(s));
 
                     for i in 0..temp_l.len().min(temp_r.len()) {
-                        push(temp_l[i]);
-                        push(temp_r[i]);
+                        chunk_buffer.push(temp_l[i]);
+                        chunk_buffer.push(temp_r[i]);
+
+                        if chunk_buffer.len() >= CHUNK_SIZE {
+                            for sample in chunk_buffer.drain(..) {
+                                push(sample);
+                            }
+                        }
                     }
                 }
             }
 
             _ => {}
         }
+    }
+
+    // Flush remaining samples
+    for sample in chunk_buffer {
+        push(sample);
     }
 
     Ok(())

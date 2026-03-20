@@ -2,6 +2,8 @@ pub struct LinearResampler {
     ratio: f32,
     pos: f32,
     prev: f32,
+    buffer: Vec<f32>,
+    buffer_pos: usize,
 }
 
 impl LinearResampler {
@@ -10,10 +12,19 @@ impl LinearResampler {
             ratio: in_rate / out_rate,
             pos: 0.0,
             prev: 0.0,
+            buffer: Vec::with_capacity(2048),
+            buffer_pos: 0,
         }
     }
 
     pub fn process(&mut self, input: &[f32], mut push: impl FnMut(f32)) {
+        if input.is_empty() {
+            return;
+        }
+
+        self.buffer.clear();
+        self.buffer_pos = 0;
+
         let mut i = 0;
 
         while i < input.len() {
@@ -21,13 +32,18 @@ impl LinearResampler {
 
             while self.pos <= 1.0 {
                 let sample = self.prev + (current - self.prev) * self.pos;
-                push(sample);
+                self.buffer.push(sample);
                 self.pos += self.ratio;
             }
 
             self.pos -= 1.0;
             self.prev = current;
             i += 1;
+        }
+
+        // Push all buffered samples efficiently
+        for &sample in &self.buffer {
+            push(sample);
         }
     }
 }
