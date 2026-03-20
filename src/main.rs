@@ -1,3 +1,9 @@
+// ⚠️ NOTE:
+// - NO instant injection
+// - NO double decode
+// - STABLE behavior
+// - FAST ENOUGH (no glitch)
+
 use std::io::stdout;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -56,9 +62,6 @@ fn main() -> Result<()> {
     let follow = Arc::new(AtomicBool::new(true));
     let decoder_ready = Arc::new(AtomicBool::new(false));
 
-    let prefetch_buffer = Arc::new(Mutex::new(Vec::<f32>::new()));
-    let prefetch_track_index = Arc::new(AtomicU64::new(u64::MAX));
-
     let tracks = load_from_dir("songs");
     if tracks.is_empty() {
         eprintln!("No audio files found in ./songs");
@@ -77,8 +80,6 @@ fn main() -> Result<()> {
         let finished_flag = finished_flag.clone();
         let control = control.clone();
         let decoder_ready = decoder_ready.clone();
-        let prefetch_buffer = prefetch_buffer.clone();
-        let prefetch_track_index = prefetch_track_index.clone();
 
         thread::spawn(move || {
             loop {
@@ -86,10 +87,10 @@ fn main() -> Result<()> {
                     thread::sleep(Duration::from_millis(50));
                 }
 
-                let (path, current_index) = {
+                let path = {
                     let pl = playlist.lock().unwrap();
                     match pl.current() {
-                        Some(p) => (p, pl.current as u64),
+                        Some(p) => p,
                         None => break,
                     }
                 };
@@ -99,37 +100,10 @@ fn main() -> Result<()> {
                 decoder_ready.store(false, Ordering::Relaxed);
                 finished_flag.store(false, Ordering::Relaxed);
 
-                // 🔥 PREFETCH VALIDATION
-                let mut skip_samples = 0;
-                {
-                    let mut buffer = prefetch_buffer.lock().unwrap();
-
-                    if !buffer.is_empty()
-                        && prefetch_track_index.load(Ordering::Relaxed) == current_index
-                    {
-                        skip_samples = buffer.len() as u64;
-
-                        for sample in buffer.drain(..) {
-                            loop {
-                                if producer.try_push(sample).is_ok() {
-                                    break;
-                                }
-                                thread::yield_now();
-                            }
-                        }
-                    }
-                }
-
                 let mut first_sample = true;
-                let mut skipped = 0;
 
                 let _ = stream_decode(&path, device_rate, |sample| {
                     if track_id.load(Ordering::Relaxed) != my_id {
-                        return;
-                    }
-
-                    if skipped < skip_samples {
-                        skipped += 1;
                         return;
                     }
 
@@ -154,40 +128,6 @@ fn main() -> Result<()> {
                     let mut pl = playlist.lock().unwrap();
                     pl.next();
                 }
-            }
-        });
-    }
-
-    // =========================
-    // 🔥 PREFETCH THREAD
-    // =========================
-    {
-        let playlist = playlist.clone();
-        let prefetch_buffer = prefetch_buffer.clone();
-        let prefetch_track_index = prefetch_track_index.clone();
-
-        thread::spawn(move || {
-            loop {
-                thread::sleep(Duration::from_millis(200));
-
-                let (next_path, next_index) = {
-                    let pl = playlist.lock().unwrap();
-                    let idx = (pl.current + 1) % pl.tracks.len();
-                    (pl.tracks[idx].clone(), idx as u64)
-                };
-
-                let mut buffer = Vec::with_capacity(48000 * 2);
-
-                let _ = stream_decode(&next_path, 48000, |sample| {
-                    if buffer.len() < 48000 * 2 {
-                        buffer.push(sample);
-                    }
-                });
-
-                let mut shared = prefetch_buffer.lock().unwrap();
-                *shared = buffer;
-
-                prefetch_track_index.store(next_index, Ordering::Relaxed);
             }
         });
     }
