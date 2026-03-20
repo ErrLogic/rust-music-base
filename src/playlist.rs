@@ -22,10 +22,20 @@ impl Playlist {
 
     pub fn prev(&mut self) {
         if self.tracks.is_empty() { return; }
+
         if self.current == 0 {
             self.current = self.tracks.len() - 1;
         } else {
             self.current -= 1;
+        }
+    }
+
+    pub fn set_by_path(&mut self, path: &str) -> bool {
+        if let Some(idx) = self.tracks.iter().position(|t| t == path) {
+            self.current = idx;
+            true
+        } else {
+            false
         }
     }
 }
@@ -45,7 +55,6 @@ pub fn load_from_dir<P: AsRef<Path>>(dir: P) -> Vec<String> {
             continue;
         }
 
-        // filter extension
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             let ext = ext.to_lowercase();
 
@@ -57,8 +66,6 @@ pub fn load_from_dir<P: AsRef<Path>>(dir: P) -> Vec<String> {
         }
     }
 
-    // 🔥 sort biar deterministic
     tracks.sort();
-
     tracks
 }

@@ -9,6 +9,9 @@ pub struct AudioControl {
     pub(crate) elapsed_samples: Arc<AtomicU64>,
     pub(crate) total_samples: Arc<AtomicU64>,
     pub(crate) sample_rate: Arc<AtomicU32>,
+
+    pub(crate) seek_target: Arc<AtomicU64>,
+    pub(crate) seeking: Arc<AtomicBool>,
 }
 
 impl AudioControl {
@@ -20,11 +23,18 @@ impl AudioControl {
             elapsed_samples: Arc::new(AtomicU64::new(0)),
             total_samples: Arc::new(AtomicU64::new(0)),
             sample_rate: Arc::new(AtomicU32::new(48000)),
+
+            seek_target: Arc::new(AtomicU64::new(0)),
+            seeking: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn volume(&self) -> f32 {
         f32::from_bits(self.volume_bits.load(Ordering::Relaxed))
+    }
+
+    pub fn set_volume(&self, v: f32) {
+        self.volume_bits.store(v.clamp(0.05, 2.0).to_bits(), Ordering::Relaxed);
     }
 
     pub fn toggle_pause(&self) {
@@ -34,8 +44,7 @@ impl AudioControl {
 
     pub fn adjust_volume(&self, delta: f32) {
         let current = self.volume();
-        let new = (current + delta).clamp(0.05, 2.0);
-        self.volume_bits.store(new.to_bits(), Ordering::Relaxed);
+        self.set_volume(current + delta);
     }
 
     pub fn is_paused(&self) -> bool {
@@ -58,10 +67,6 @@ impl AudioControl {
         self.elapsed_samples.store(samples, Ordering::Relaxed)
     }
 
-    // pub fn reset_elapsed(&self) {
-    //     self.elapsed_samples.store(0, Ordering::Relaxed);
-    // }
-
     pub fn set_total_samples(&self, total: u64) {
         self.total_samples.store(total, Ordering::Relaxed);
     }
@@ -81,11 +86,22 @@ impl AudioControl {
     pub fn reset_for_new_track(&self) {
         self.elapsed_samples.store(0, Ordering::Relaxed);
         self.total_samples.store(0, Ordering::Relaxed);
-
-        // penting: jangan reset started
-        // karena engine butuh tetap jalan
-
-        // reset pause supaya konsisten
         self.paused.store(false, Ordering::Relaxed);
+
+        self.seeking.store(false, Ordering::Relaxed);
+        self.seek_target.store(0, Ordering::Relaxed);
+    }
+
+    pub fn request_seek(&self, target_samples: u64) {
+        self.seek_target.store(target_samples, Ordering::Relaxed);
+        self.seeking.store(true, Ordering::Relaxed);
+    }
+
+    pub fn take_seek(&self) -> Option<u64> {
+        if self.seeking.swap(false, Ordering::Relaxed) {
+            Some(self.seek_target.load(Ordering::Relaxed))
+        } else {
+            None
+        }
     }
 }
