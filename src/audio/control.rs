@@ -1,5 +1,6 @@
 use std::sync::atomic::AtomicU64;
-use std::sync::{atomic::{AtomicBool, AtomicU32, Ordering}, Arc};
+use std::sync::{atomic::{AtomicBool, AtomicU32, Ordering}, Arc, Mutex};
+use std::time::Instant;
 
 #[derive(Clone)]
 pub struct AudioControl {
@@ -9,9 +10,8 @@ pub struct AudioControl {
     pub(crate) elapsed_samples: Arc<AtomicU64>,
     pub(crate) total_samples: Arc<AtomicU64>,
     pub(crate) sample_rate: Arc<AtomicU32>,
-
-    pub(crate) seek_target: Arc<AtomicU64>,
-    pub(crate) seeking: Arc<AtomicBool>,
+    pub(crate) start_time: Arc<Mutex<Option<Instant>>>,
+    pub(crate) started_at_output: Arc<AtomicBool>,
 }
 
 impl AudioControl {
@@ -23,9 +23,8 @@ impl AudioControl {
             elapsed_samples: Arc::new(AtomicU64::new(0)),
             total_samples: Arc::new(AtomicU64::new(0)),
             sample_rate: Arc::new(AtomicU32::new(48000)),
-
-            seek_target: Arc::new(AtomicU64::new(0)),
-            seeking: Arc::new(AtomicBool::new(false)),
+            start_time: Arc::new(Mutex::new(None)),
+            started_at_output: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -46,13 +45,12 @@ impl AudioControl {
         let current = self.volume();
         self.set_volume(current + delta);
     }
-
-    pub fn is_paused(&self) -> bool {
-        self.paused.load(Ordering::Relaxed)
-    }
-
+    
     pub fn start(&self) {
         self.started.store(true, Ordering::Relaxed);
+
+        let mut st = self.start_time.lock().unwrap();
+        *st = Some(Instant::now());
     }
 
     pub fn is_started(&self) -> bool {
@@ -87,21 +85,19 @@ impl AudioControl {
         self.elapsed_samples.store(0, Ordering::Relaxed);
         self.total_samples.store(0, Ordering::Relaxed);
         self.paused.store(false, Ordering::Relaxed);
-        self.seeking.store(false, Ordering::Relaxed);
-        self.seek_target.store(0, Ordering::Relaxed);
+        self.started_at_output.store(false, Ordering::Relaxed);
+
+        let mut st = self.start_time.lock().unwrap();
+        *st = None;
     }
 
-    pub fn request_seek(&self, target_samples: u64) {
-        self.seek_target.store(target_samples, Ordering::Relaxed);
-        self.seeking.store(true, Ordering::Relaxed);
-        self.elapsed_samples.store(target_samples, Ordering::Relaxed);
-    }
+    pub fn elapsed_time(&self) -> f32 {
+        let st = self.start_time.lock().unwrap();
 
-    pub fn take_seek(&self) -> Option<u64> {
-        if self.seeking.swap(false, Ordering::Relaxed) {
-            Some(self.seek_target.load(Ordering::Relaxed))
+        if let Some(start) = *st {
+            start.elapsed().as_secs_f32()
         } else {
-            None
+            0.0
         }
     }
 }

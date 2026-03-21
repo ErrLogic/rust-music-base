@@ -1,19 +1,15 @@
 pub struct LinearResampler {
     ratio: f32,
     pos: f32,
-    prev: f32,
-    buffer: Vec<f32>,
-    buffer_pos: usize,
+    input_buffer: Vec<f32>,
 }
 
 impl LinearResampler {
     pub fn new(in_rate: f32, out_rate: f32) -> Self {
         Self {
-            ratio: in_rate / out_rate,
+            ratio: in_rate / out_rate, // 🔥 IMPORTANT
             pos: 0.0,
-            prev: 0.0,
-            buffer: Vec::with_capacity(2048),
-            buffer_pos: 0,
+            input_buffer: Vec::new(),
         }
     }
 
@@ -22,28 +18,30 @@ impl LinearResampler {
             return;
         }
 
-        self.buffer.clear();
-        self.buffer_pos = 0;
+        // append input
+        self.input_buffer.extend_from_slice(input);
 
-        let mut i = 0;
+        // output-driven sampling
+        while self.pos < self.input_buffer.len() as f32 - 1.0 {
+            let i = self.pos as usize;
+            let frac = self.pos - i as f32;
 
-        while i < input.len() {
-            let current = input[i];
+            let s0 = self.input_buffer[i];
+            let s1 = self.input_buffer[i + 1];
 
-            while self.pos <= 1.0 {
-                let sample = self.prev + (current - self.prev) * self.pos;
-                self.buffer.push(sample);
-                self.pos += self.ratio;
-            }
+            // linear interpolation
+            let sample = s0 + (s1 - s0) * frac;
 
-            self.pos -= 1.0;
-            self.prev = current;
-            i += 1;
+            push(sample);
+
+            self.pos += self.ratio;
         }
 
-        // Push all buffered samples efficiently
-        for &sample in &self.buffer {
-            push(sample);
+        // cleanup consumed samples
+        let consumed = self.pos.floor() as usize;
+        if consumed > 0 {
+            self.input_buffer.drain(0..consumed);
+            self.pos -= consumed as f32;
         }
     }
 }

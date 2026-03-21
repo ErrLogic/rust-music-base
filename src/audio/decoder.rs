@@ -1,25 +1,24 @@
-use symphonia::core::audio::Signal;
 use crate::audio::resampler::LinearResampler;
+use symphonia::core::audio::Signal;
 
 pub struct DecodeInfo {
     pub sample_rate: u32,
     pub total_samples: u64,
 }
 
-pub fn stream_decode_with_seek<P: AsRef<std::path::Path>>(
+pub fn stream_decode<P: AsRef<std::path::Path>>(
     path: P,
     out_rate: u32,
-    seek_samples: u64,
-    mut push: impl FnMut(f32),
+    mut push: impl FnMut(f32) -> bool, // 🔥 return bool
 ) -> anyhow::Result<()> {
     use symphonia::core::{
         audio::AudioBufferRef,
         codecs::DecoderOptions,
-        formats::{FormatOptions, SeekMode, SeekTo},
+        formats::FormatOptions,
         io::MediaSourceStream,
         meta::MetadataOptions,
-        probe::Hint,
-        units::Time,
+        probe::Hint
+        ,
     };
 
     let file = std::fs::File::open(path)?;
@@ -31,27 +30,12 @@ pub fn stream_decode_with_seek<P: AsRef<std::path::Path>>(
     let mut format = probed.format;
     let track = format.default_track().unwrap();
 
-    let sample_rate = track.codec_params.sample_rate.unwrap_or(48000);
-
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())?;
-
-    // 🔥 OPTIMIZED SEEK: Use Accurate mode for better precision
-    if seek_samples > 0 && sample_rate > 0 {
-        let seconds = seek_samples as f64 / sample_rate as f64;
-        let seek_to = SeekTo::Time {
-            time: Time::from(seconds),
-            track_id: Some(track.id),
-        };
-
-        // Use Accurate seek for better precision
-        let _ = format.seek(SeekMode::Accurate, seek_to);
-    }
 
     let mut resampler_l: Option<LinearResampler> = None;
     let mut resampler_r: Option<LinearResampler> = None;
 
-    // Small buffer to reduce overhead
     const CHUNK_SIZE: usize = 1024;
     let mut chunk_buffer = Vec::with_capacity(CHUNK_SIZE);
 
@@ -88,7 +72,9 @@ pub fn stream_decode_with_seek<P: AsRef<std::path::Path>>(
 
                         if chunk_buffer.len() >= CHUNK_SIZE {
                             for sample in chunk_buffer.drain(..) {
-                                push(sample);
+                                if !push(sample) {
+                                    return;
+                                }
                             }
                         }
                     });
@@ -105,7 +91,9 @@ pub fn stream_decode_with_seek<P: AsRef<std::path::Path>>(
 
                         if chunk_buffer.len() >= CHUNK_SIZE {
                             for sample in chunk_buffer.drain(..) {
-                                push(sample);
+                                if !push(sample) {
+                                    return Ok(());
+                                }
                             }
                         }
                     }
@@ -139,7 +127,9 @@ pub fn stream_decode_with_seek<P: AsRef<std::path::Path>>(
 
                         if chunk_buffer.len() >= CHUNK_SIZE {
                             for sample in chunk_buffer.drain(..) {
-                                push(sample);
+                                if !push(sample) {
+                                    return;
+                                }
                             }
                         }
                     });
@@ -168,7 +158,9 @@ pub fn stream_decode_with_seek<P: AsRef<std::path::Path>>(
 
                         if chunk_buffer.len() >= CHUNK_SIZE {
                             for sample in chunk_buffer.drain(..) {
-                                push(sample);
+                                if !push(sample) {
+                                    return Ok(());
+                                }
                             }
                         }
                     }
@@ -179,9 +171,10 @@ pub fn stream_decode_with_seek<P: AsRef<std::path::Path>>(
         }
     }
 
-    // Flush remaining samples
     for sample in chunk_buffer {
-        push(sample);
+        if !push(sample) {
+            break;
+        }
     }
 
     Ok(())

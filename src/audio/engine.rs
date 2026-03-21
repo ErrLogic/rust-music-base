@@ -30,6 +30,10 @@ impl AudioEngine {
         let paused_flag = audio_control.paused.clone();
         let volume_bits = audio_control.volume_bits.clone();
         let started_flag = audio_control.started.clone();
+
+        let started_output_flag = audio_control.started_at_output.clone();
+        let start_time = audio_control.start_time.clone();
+
         let elapsed_samples = audio_control.elapsed_samples.clone();
 
         let stream = device.build_output_stream(
@@ -45,6 +49,14 @@ impl AudioEngine {
                     let (mut l, mut r) = (0.0, 0.0);
 
                     if is_started && !is_paused {
+                        if !started_output_flag.load(Ordering::Relaxed) {
+                            if let Some(_) = consumer.try_peek() {
+                                let mut st = start_time.lock().unwrap();
+                                *st = Some(std::time::Instant::now());
+                                started_output_flag.store(true, Ordering::Relaxed);
+                            }
+                        }
+
                         if let Some(sample_l) = consumer.try_pop() {
                             l = sample_l;
                             frames_played += 1;
