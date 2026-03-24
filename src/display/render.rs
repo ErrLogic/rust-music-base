@@ -104,7 +104,7 @@ fn draw_modern_border(fb: &mut Framebuffer) {
 }
 
 fn draw_volume_bar(fb: &mut Framebuffer, x: u16, y: u16, width: u16, volume: u32) {
-    let bar_height = 4;  // Slightly taller for better visibility
+    let bar_height = 4;
     let bar_width = (width as f32 * (volume as f32 / 100.0)) as u16;
 
     draw_rect(fb, x, y, width, bar_height, colors::volume_bg());
@@ -131,24 +131,24 @@ pub fn render(
     let width = fb.width - padding * 2;
 
     // =========================
-    // LAYOUT ADJUSTED FOR LARGER FONT
+    // LAYOUT ADJUSTED FOR FULL WIDTH TITLE
     // =========================
     let header_top = 8;
-    let now_playing_y = 24;      // Increased for larger font
-    let title_y = 40;            // Increased gap
-    let progress_y = 66;         // Adjusted
-    let time_y = 80;             // Adjusted
-    let volume_y = 98;           // Adjusted
+    let now_playing_y = 24;
+    let title_y = 40;
+    let progress_y = 66;
+    let time_y = 80;
+    let volume_y = 98;
     let volume_percent_x = fb.width - padding - 35;
-    let separator_y = 116;       // Adjusted
-    let playlist_header_y = 130; // Adjusted
-    let playlist_top = 144;      // Adjusted
+    let separator_y = 116;
+    let playlist_header_y = 130;
+    let playlist_top = 144;
     let playlist_bottom = fb.height - 18;
 
     // =========================
     // ANIMATION UPDATE
     // =========================
-    let item_height = 16.0;      // Increased for larger font
+    let item_height = 16.0;
     let viewport_height = (playlist_bottom - playlist_top) as f32;
     let center_offset = viewport_height / 2.0 - item_height / 2.0;
 
@@ -165,18 +165,24 @@ pub fn render(
     draw_text(fb, padding as i32, now_playing_y, "NOW PLAYING", colors::text_secondary());
 
     // =========================
-    // NOW PLAYING TRACK
+    // NOW PLAYING TRACK - FULL WIDTH (calculate max characters based on screen width)
     // =========================
-    let title = if state.title.len() > 20 {  // Reduced max chars for larger font
+    // Calculate maximum characters that fit in the screen width
+    // Each character is approximately 7 pixels wide (6px char + 1px spacing)
+    let max_chars = ((width as i32 - 16) / 7) as usize;  // -16 for prefix and margins
+
+    let title = if state.title.len() > max_chars {
+        // Use marquee scrolling for long titles
         let padded = format!("{}   ", state.title);
         let extended = padded.repeat(2);
 
         extended
             .chars()
             .skip(state.marquee_offset % padded.len())
-            .take(20)
+            .take(max_chars)
             .collect::<String>()
     } else {
+        // Short title, just display it without scrolling
         state.title.clone()
     };
 
@@ -199,7 +205,7 @@ pub fn render(
     let total_str = format_time(state.total_sec);
 
     draw_text(fb, padding as i32, time_y, &elapsed_str, colors::text_secondary());
-    let total_width = (total_str.len() * 7) as i32; // Adjusted for larger font width
+    let total_width = (total_str.len() * 7) as i32;
     draw_text(fb, fb.width as i32 - padding as i32 - total_width, time_y, &total_str, colors::text_secondary());
 
     // =========================
@@ -222,8 +228,10 @@ pub fn render(
     draw_text(fb, padding as i32, playlist_header_y, "PLAYLIST", colors::accent_secondary());
 
     // =========================
-    // PLAYLIST ITEMS
+    // PLAYLIST ITEMS - Also increased width
     // =========================
+    let max_playlist_chars = ((width as i32 - 32) / 7) as usize; // More space for playlist items
+
     for (i, track) in state.playlist.iter().enumerate() {
         let y = playlist_top as f32 + (i as f32 * item_height) - rs.scroll;
 
@@ -239,7 +247,7 @@ pub fn render(
         let is_selected = i == state.selected;
         let is_playing = i == state.playing_index;
 
-        // Background for selected item (adjusted height for larger font)
+        // Background for selected item
         if is_selected {
             let y_u16 = y as u16;
             if y_u16 + 14 < fb.height {
@@ -263,18 +271,17 @@ pub fn render(
             colors::text_secondary()
         };
 
-        let max_name_len = 28; // Reduced for larger font
-        let display_name = if is_selected && name.len() > max_name_len {
+        let display_name = if is_selected && name.len() > max_playlist_chars {
             let padded = format!("{}   ", name);
             let extended = padded.repeat(2);
 
             extended
                 .chars()
                 .skip(state.marquee_offset % padded.len())
-                .take(max_name_len)
+                .take(max_playlist_chars)
                 .collect::<String>()
         } else {
-            truncate(name, max_name_len)
+            truncate(name, max_playlist_chars)
         };
 
         let final_text = format!("{}{}", prefix, display_name);
@@ -291,6 +298,6 @@ pub fn render(
     // =========================
     let status = if state.is_playing { "▶ PLAYING" } else { "⏸ PAUSED" };
     let status_color = if state.is_playing { colors::playing() } else { colors::paused() };
-    let status_width = status.len() as i32 * 7; // Adjusted for larger font width
+    let status_width = status.len() as i32 * 7;
     draw_text(fb, fb.width as i32 - padding as i32 - status_width, (fb.height - 10) as i32, status, status_color);
 }
