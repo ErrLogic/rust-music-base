@@ -114,6 +114,45 @@ fn draw_volume_bar(fb: &mut Framebuffer, x: u16, y: u16, width: u16, volume: u32
     }
 }
 
+/// Draw vertical scroll bar for playlist
+fn draw_scroll_bar(
+    fb: &mut Framebuffer,
+    x: u16,
+    top_y: u16,
+    bottom_y: u16,
+    current_index: usize,
+    total_items: usize,
+    visible_items: usize,
+) {
+    if total_items == 0 || visible_items == 0 || total_items <= visible_items {
+        return;
+    }
+
+    let bar_width = 3; // Thin bar
+    let scroll_area_height = bottom_y - top_y;
+
+    // Calculate scroll bar position
+    let scroll_ratio = if total_items > visible_items {
+        current_index as f32 / (total_items - visible_items) as f32
+    } else {
+        0.0
+    };
+
+    let bar_height = (scroll_area_height as f32 * (visible_items as f32 / total_items as f32))
+        .max(bar_width as f32) as u16;
+
+    let bar_y = top_y + (scroll_area_height as f32 * scroll_ratio) as u16;
+    let bar_y = bar_y.min(bottom_y - bar_height);
+
+    // Draw scroll bar background (thin line)
+    // Using draw_vline for the background would be inefficient for a thick line
+    // So we use draw_rect for the background
+    draw_rect(fb, x, top_y, bar_width, scroll_area_height, colors::volume_bg());
+
+    // Draw scroll bar indicator
+    draw_rect(fb, x, bar_y, bar_width, bar_height, colors::volume_fill());
+}
+
 pub fn render(
     fb: &mut Framebuffer,
     state: &DisplayState,
@@ -131,7 +170,7 @@ pub fn render(
     let width = fb.width - padding * 2;
 
     // =========================
-    // LAYOUT ADJUSTED FOR FULL WIDTH TITLE
+    // LAYOUT
     // =========================
     let header_top = 8;
     let now_playing_y = 24;
@@ -145,11 +184,15 @@ pub fn render(
     let playlist_top = 144;
     let playlist_bottom = fb.height - 18;
 
+    // Scroll bar position (right side, with padding)
+    let scroll_bar_x = fb.width - padding - 4; // 3px bar + 1px margin
+
     // =========================
     // ANIMATION UPDATE
     // =========================
     let item_height = 16.0;
     let viewport_height = (playlist_bottom - playlist_top) as f32;
+    let visible_items = (viewport_height / item_height) as usize;
     let center_offset = viewport_height / 2.0 - item_height / 2.0;
 
     let target_scroll = (state.selected as f32 * item_height) - center_offset;
@@ -165,14 +208,11 @@ pub fn render(
     draw_text(fb, padding as i32, now_playing_y, "NOW PLAYING", colors::text_secondary());
 
     // =========================
-    // NOW PLAYING TRACK - FULL WIDTH (calculate max characters based on screen width)
+    // NOW PLAYING TRACK - FULL WIDTH
     // =========================
-    // Calculate maximum characters that fit in the screen width
-    // Each character is approximately 7 pixels wide (6px char + 1px spacing)
-    let max_chars = ((width as i32 - 16) / 7) as usize;  // -16 for prefix and margins
+    let max_chars = ((width as i32 - 16) / 7) as usize;
 
     let title = if state.title.len() > max_chars {
-        // Use marquee scrolling for long titles
         let padded = format!("{}   ", state.title);
         let extended = padded.repeat(2);
 
@@ -182,7 +222,6 @@ pub fn render(
             .take(max_chars)
             .collect::<String>()
     } else {
-        // Short title, just display it without scrolling
         state.title.clone()
     };
 
@@ -228,9 +267,10 @@ pub fn render(
     draw_text(fb, padding as i32, playlist_header_y, "PLAYLIST", colors::accent_secondary());
 
     // =========================
-    // PLAYLIST ITEMS - Also increased width
+    // PLAYLIST ITEMS (with reduced width to make room for scroll bar)
     // =========================
-    let max_playlist_chars = ((width as i32 - 32) / 7) as usize; // More space for playlist items
+    let playlist_width = width - 8; // Make room for scroll bar
+    let max_playlist_chars = ((playlist_width as i32 - 32) / 7) as usize;
 
     for (i, track) in state.playlist.iter().enumerate() {
         let y = playlist_top as f32 + (i as f32 * item_height) - rs.scroll;
@@ -251,7 +291,7 @@ pub fn render(
         if is_selected {
             let y_u16 = y as u16;
             if y_u16 + 14 < fb.height {
-                draw_rect(fb, padding, y_u16, width, 14, colors::bg_highlight());
+                draw_rect(fb, padding, y_u16, playlist_width, 14, colors::bg_highlight());
             }
         }
 
@@ -287,6 +327,19 @@ pub fn render(
         let final_text = format!("{}{}", prefix, display_name);
         draw_text(fb, padding as i32, y as i32, &final_text, color);
     }
+
+    // =========================
+    // SCROLL BAR INDICATOR
+    // =========================
+    draw_scroll_bar(
+        fb,
+        scroll_bar_x,
+        playlist_top,
+        playlist_bottom,
+        state.selected,
+        state.playlist.len(),
+        visible_items,
+    );
 
     // =========================
     // BORDER
