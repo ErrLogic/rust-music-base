@@ -45,7 +45,7 @@ impl AudioControl {
         let current = self.volume();
         self.set_volume(current + delta);
     }
-    
+
     pub fn start(&self) {
         self.started.store(true, Ordering::Relaxed);
 
@@ -55,6 +55,16 @@ impl AudioControl {
 
     pub fn is_started(&self) -> bool {
         self.started.load(Ordering::Relaxed)
+    }
+
+    // ADD THIS METHOD - determines if audio is currently playing
+    pub fn is_playing(&self) -> bool {
+        self.is_started() && !self.is_paused()
+    }
+
+    // ADD THIS METHOD - checks if paused
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
     }
 
     pub fn elapsed(&self) -> u64 {

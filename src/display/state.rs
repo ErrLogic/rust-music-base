@@ -1,28 +1,81 @@
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
 use crate::playlist::Playlist;
 use crate::audio::control::AudioControl;
 
-static mut LAST_SELECTED: usize = usize::MAX;
-
 pub struct DisplayState {
     pub title: String,
+    pub progress: f32,
     pub elapsed_sec: f32,
     pub total_sec: f32,
-    pub progress: f32,
-    pub marquee_offset: usize,
     pub playlist: Vec<String>,
-    pub selected: usize,
+    pub selected: usize,      // Currently selected/highlighted track in playlist (for navigation)
+    pub playing_index: usize, // Actually playing track
     pub volume: u32,
+    pub marquee_offset: usize,
+    pub is_playing: bool,
 }
 
+// =========================
+// VISUAL STATE
+// =========================
+pub struct RenderState {
+    pub smooth_progress: f32,
+    pub scroll: f32,
+    last_frame: Instant,
+    pub fps: f32,
+    frame_count: u32,
+    fps_timer: Instant,
+}
+
+impl RenderState {
+    pub fn new() -> Self {
+        Self {
+            smooth_progress: 0.0,
+            scroll: 0.0,
+            last_frame: Instant::now(),
+            fps: 0.0,
+            frame_count: 0,
+            fps_timer: Instant::now(),
+        }
+    }
+
+    pub fn update(&mut self, target_progress: f32, target_scroll: f32) {
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_frame).as_secs_f32();
+        self.last_frame = now;
+
+        self.frame_count += 1;
+        if self.fps_timer.elapsed() >= Duration::from_secs(1) {
+            self.fps = self.frame_count as f32;
+            self.frame_count = 0;
+            self.fps_timer = Instant::now();
+        }
+
+        let alpha = (dt * 12.0).min(1.0);
+        self.smooth_progress += (target_progress - self.smooth_progress) * alpha;
+
+        let scroll_speed = 12.0;
+        let s_alpha = (dt * scroll_speed).min(1.0);
+        self.scroll += (target_scroll - self.scroll) * s_alpha;
+    }
+}
+
+// =========================
+// BUILD STATE
+// =========================
 pub fn build_display_state(
     playlist: &Arc<Mutex<Playlist>>,
     control: &AudioControl,
+    is_playing: bool,
+    selected_index: usize,  // Pass selected index separately
 ) -> DisplayState {
     let pl = playlist.lock().unwrap();
 
-    let raw = pl.current().unwrap_or_default();
-    let title = truncate(&*clean_title(&*raw), 20);
+    // Get currently playing track
+    let playing_path = pl.current().unwrap_or_default();
+    let title = clean_title(&playing_path);
 
     let elapsed_sec = control.elapsed_time();
 
@@ -37,62 +90,35 @@ pub fn build_display_state(
     } else {
         0.0
     };
-    
-    let playlist = pl.tracks.clone();
-    let selected = pl.current;
-    let marquee_offset = next_marquee_offset(title.len(), selected);
-    let volume = (control.volume().clamp(0.0, 1.0) * 100.0) as u32;
 
     DisplayState {
         title,
+        progress,
         elapsed_sec,
         total_sec,
-        progress,
-        marquee_offset,
-        playlist,
-        selected,
-        volume,
+        playlist: pl.tracks.clone(),
+        selected: selected_index,           // Use the passed selected index
+        playing_index: pl.current,          // Playing index is the actual playing track
+        volume: (control.volume().clamp(0.0, 1.0) * 100.0) as u32,
+        marquee_offset: next_marquee_offset(),
+        is_playing,
     }
 }
 
-fn next_marquee_offset(title_len: usize, selected: usize) -> usize {
-    use std::time::{Instant, Duration};
-
+// =========================
+// MARQUEE
+// =========================
+fn next_marquee_offset() -> usize {
     static mut OFFSET: usize = 0;
     static mut LAST: Option<Instant> = None;
-    static mut PAUSE: Option<Instant> = None;
 
     unsafe {
         let now = Instant::now();
 
-        if LAST_SELECTED != selected {
-            OFFSET = 0;
-            LAST = Some(now);
-            PAUSE = Some(now + Duration::from_secs(2));
-            LAST_SELECTED = selected;
-            return OFFSET;
-        }
-
-        // 🔥 PAUSE PHASE
-        if let Some(until) = PAUSE {
-            if now < until {
-                return OFFSET;
-            } else {
-                PAUSE = None;
-            }
-        }
-
-        // 🔥 UPDATE
         if let Some(last) = LAST {
-            if now.duration_since(last) > Duration::from_millis(200) {
+            if now.duration_since(last) > Duration::from_millis(120) {
                 OFFSET += 1;
                 LAST = Some(now);
-
-                // 🔥 LOOP + PAUSE
-                if OFFSET > title_len {
-                    OFFSET = 0;
-                    PAUSE = Some(now + Duration::from_secs(2));
-                }
             }
         } else {
             LAST = Some(now);
@@ -102,6 +128,9 @@ fn next_marquee_offset(title_len: usize, selected: usize) -> usize {
     }
 }
 
+// =========================
+// UTILS
+// =========================
 pub fn format_time(sec: f32) -> String {
     let total = sec as u32;
     let m = total / 60;
@@ -117,12 +146,14 @@ fn clean_title(path: &str) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or(path)
         .replace("_", " ")
+        .replace("-", " - ")
 }
 
-pub(crate) fn truncate(text: &str, max: usize) -> String {
-    if text.len() <= max {
+pub fn truncate(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
         text.to_string()
     } else {
-        format!("{}...", &text[..max])
+        let truncated: String = text.chars().take(max - 3).collect();
+        format!("{}...", truncated)
     }
 }

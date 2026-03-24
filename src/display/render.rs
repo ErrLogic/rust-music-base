@@ -1,7 +1,9 @@
 use std::path::Path;
+
 use crate::display::text::draw_text;
-use super::framebuffer::{Framebuffer, rgb565};
-use super::state::{format_time, DisplayState, truncate};
+
+use super::framebuffer::{Framebuffer, colors};
+use super::state::{DisplayState, RenderState, format_time, truncate};
 
 pub fn draw_rect(
     fb: &mut Framebuffer,
@@ -13,108 +15,282 @@ pub fn draw_rect(
 ) {
     for dy in 0..h {
         for dx in 0..w {
-            fb.set_pixel(x + dx, y + dy, color);
+            let px = x + dx;
+            let py = y + dy;
+            if px < fb.width && py < fb.height {
+                fb.set_pixel(px, py, color);
+            }
         }
     }
 }
 
-pub fn render(fb: &mut Framebuffer, state: &DisplayState) {
-    // clear screen
-    fb.clear(rgb565(0, 0, 0));
+pub fn draw_rounded_rect(
+    fb: &mut Framebuffer,
+    x: u16,
+    y: u16,
+    w: u16,
+    h: u16,
+    radius: u16,
+    color: u16,
+) {
+    if w < radius * 2 || h < radius * 2 {
+        draw_rect(fb, x, y, w, h, color);
+        return;
+    }
 
-    // setup
-    let title_y = 10;
-    let bar_y   = 40;
-    let time_y  = 60;
+    for dy in 0..h {
+        for dx in 0..w {
+            let px = x + dx;
+            let py = y + dy;
 
-    // Title
-    let display_title = {
+            if px >= fb.width || py >= fb.height {
+                continue;
+            }
+
+            let in_corner = (dx < radius && dy < radius) ||
+                (dx < radius && dy >= h - radius) ||
+                (dx >= w - radius && dy < radius) ||
+                (dx >= w - radius && dy >= h - radius);
+
+            if in_corner {
+                let corner_dist_x = if dx < radius { radius - dx } else { dx - (w - radius) };
+                let corner_dist_y = if dy < radius { radius - dy } else { dy - (h - radius) };
+
+                if (corner_dist_x as f32).hypot(corner_dist_y as f32) <= radius as f32 {
+                    fb.set_pixel(px, py, color);
+                }
+            } else {
+                fb.set_pixel(px, py, color);
+            }
+        }
+    }
+}
+
+pub fn draw_hline(fb: &mut Framebuffer, y: u16, color: u16) {
+    if y < fb.height {
+        for x in 0..fb.width {
+            fb.set_pixel(x, y, color);
+        }
+    }
+}
+
+fn draw_modern_border(fb: &mut Framebuffer) {
+    let w = fb.width;
+    let h = fb.height;
+
+    for x in 0..w {
+        fb.set_pixel(x, 0, colors::border());
+        fb.set_pixel(x, h - 1, colors::border());
+    }
+
+    for y in 0..h {
+        fb.set_pixel(0, y, colors::border());
+        fb.set_pixel(w - 1, y, colors::border());
+    }
+
+    for x in 1..w-1 {
+        if 1 < h && h - 2 < h {
+            fb.set_pixel(x, 1, colors::text_muted());
+            fb.set_pixel(x, h - 2, colors::text_muted());
+        }
+    }
+
+    for y in 1..h-1 {
+        if 1 < w && w - 2 < w {
+            fb.set_pixel(1, y, colors::text_muted());
+            fb.set_pixel(w - 2, y, colors::text_muted());
+        }
+    }
+}
+
+fn draw_volume_bar(fb: &mut Framebuffer, x: u16, y: u16, width: u16, volume: u32) {
+    let bar_height = 4;  // Slightly taller for better visibility
+    let bar_width = (width as f32 * (volume as f32 / 100.0)) as u16;
+
+    draw_rect(fb, x, y, width, bar_height, colors::volume_bg());
+
+    if bar_width > 0 {
+        draw_rect(fb, x, y, bar_width, bar_height, colors::volume_fill());
+    }
+}
+
+pub fn render(
+    fb: &mut Framebuffer,
+    state: &DisplayState,
+    rs: &mut RenderState,
+) {
+    // Simple dark background
+    for y in 0..fb.height {
+        let color = super::framebuffer::rgb565(10, 12, 18);
+        for x in 0..fb.width {
+            fb.set_pixel(x, y, color);
+        }
+    }
+
+    let padding: u16 = 8;
+    let width = fb.width - padding * 2;
+
+    // =========================
+    // LAYOUT ADJUSTED FOR LARGER FONT
+    // =========================
+    let header_top = 8;
+    let now_playing_y = 24;      // Increased for larger font
+    let title_y = 40;            // Increased gap
+    let progress_y = 66;         // Adjusted
+    let time_y = 80;             // Adjusted
+    let volume_y = 98;           // Adjusted
+    let volume_percent_x = fb.width - padding - 35;
+    let separator_y = 116;       // Adjusted
+    let playlist_header_y = 130; // Adjusted
+    let playlist_top = 144;      // Adjusted
+    let playlist_bottom = fb.height - 18;
+
+    // =========================
+    // ANIMATION UPDATE
+    // =========================
+    let item_height = 16.0;      // Increased for larger font
+    let viewport_height = (playlist_bottom - playlist_top) as f32;
+    let center_offset = viewport_height / 2.0 - item_height / 2.0;
+
+    let target_scroll = (state.selected as f32 * item_height) - center_offset;
+    let max_scroll = (state.playlist.len() as f32 * item_height - viewport_height).max(0.0);
+    let target_scroll = target_scroll.clamp(0.0, max_scroll);
+
+    rs.update(state.progress, target_scroll);
+
+    // =========================
+    // HEADER SECTION
+    // =========================
+    draw_text(fb, padding as i32, header_top, "MUSIC PLAYER", colors::accent_primary());
+    draw_text(fb, padding as i32, now_playing_y, "NOW PLAYING", colors::text_secondary());
+
+    // =========================
+    // NOW PLAYING TRACK
+    // =========================
+    let title = if state.title.len() > 20 {  // Reduced max chars for larger font
         let padded = format!("{}   ", state.title);
         let extended = padded.repeat(2);
-
-        let width = 20; // jumlah karakter terlihat
 
         extended
             .chars()
             .skip(state.marquee_offset % padded.len())
-            .take(width)
+            .take(20)
             .collect::<String>()
+    } else {
+        state.title.clone()
     };
 
-    let title_x = 240 / 2 - (display_title.len() as i32 * 6 / 2);
-    draw_text(fb, title_x, title_y, &display_title, 0xFFFF);
+    draw_text(fb, padding as i32, title_y, &title, colors::text_primary());
 
-    // volume
-    let volume_text = format!("VOL {}%", state.volume);
-    draw_text(fb, 20, 30, &volume_text, rgb565(180, 180, 180));
+    // =========================
+    // PROGRESS BAR
+    // =========================
+    draw_rounded_rect(fb, padding, progress_y, width, 4, 2, colors::progress_bg());
 
-    // progress bar background
-    draw_rect(fb, 20, bar_y - 1, 200, 12, rgb565(50, 50, 50));
+    let filled = (width as f32 * rs.smooth_progress) as u16;
+    if filled > 0 && filled <= width {
+        draw_rounded_rect(fb, padding, progress_y, filled, 4, 2, colors::progress_fill());
+    }
 
-    // progress bar fill
-    let filled = (200.0 * state.progress) as u16;
-    draw_rect(fb, 20, bar_y, filled, 10, rgb565(0, 255, 0));
+    // =========================
+    // TIME DISPLAY
+    // =========================
+    let elapsed_str = format_time(state.elapsed_sec);
+    let total_str = format_time(state.total_sec);
 
-    // Time
-    let time_str = format!(
-        "{} / {}",
-        format_time(state.elapsed_sec),
-        format_time(state.total_sec)
-    );
+    draw_text(fb, padding as i32, time_y, &elapsed_str, colors::text_secondary());
+    let total_width = (total_str.len() * 7) as i32; // Adjusted for larger font width
+    draw_text(fb, fb.width as i32 - padding as i32 - total_width, time_y, &total_str, colors::text_secondary());
 
-    let time_x = 240 / 2 - (time_str.len() as i32 * 6 / 2);
-    draw_text(fb, time_x, time_y, &time_str, 0xFFFF);
+    // =========================
+    // VOLUME SECTION
+    // =========================
+    draw_text(fb, padding as i32, volume_y, "VOLUME", colors::text_secondary());
+    let volume_bar_width = 70;
+    draw_volume_bar(fb, padding + 55, (volume_y + 2) as u16, volume_bar_width, state.volume);
+    draw_text(fb, volume_percent_x as i32, volume_y, &format!("{}%", state.volume), colors::accent_secondary());
 
-    let start_y = 100;
-    let line_height = 12;
+    // =========================
+    // SEPARATOR
+    // =========================
+    draw_hline(fb, separator_y, colors::border());
+    draw_hline(fb, separator_y + 1, colors::bg_highlight());
 
-    let window_size = 5;
-    let half = window_size / 2;
+    // =========================
+    // PLAYLIST HEADER
+    // =========================
+    draw_text(fb, padding as i32, playlist_header_y, "PLAYLIST", colors::accent_secondary());
 
-    let start = state.selected.saturating_sub(half);
-    let end = (start + window_size).min(state.playlist.len());
+    // =========================
+    // PLAYLIST ITEMS
+    // =========================
+    for (i, track) in state.playlist.iter().enumerate() {
+        let y = playlist_top as f32 + (i as f32 * item_height) - rs.scroll;
 
-    for (i, track) in state.playlist[start..end].iter().enumerate() {
-        let idx = start + i;
+        if y < playlist_top as f32 || y > playlist_bottom as f32 {
+            continue;
+        }
 
         let name = Path::new(track)
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or(track);
 
-        let y = start_y + (i as i32 * line_height);
+        let is_selected = i == state.selected;
+        let is_playing = i == state.playing_index;
 
-        let is_selected = idx == state.selected;
+        // Background for selected item (adjusted height for larger font)
+        if is_selected {
+            let y_u16 = y as u16;
+            if y_u16 + 14 < fb.height {
+                draw_rect(fb, padding, y_u16, width, 14, colors::bg_highlight());
+            }
+        }
 
-        let color = if is_selected {
-            rgb565(0, 255, 0)
+        let prefix = if is_playing {
+            "▶ "
+        } else if is_selected {
+            "• "
         } else {
-            rgb565(200, 200, 200)
+            "  "
         };
 
-        let display_text = if is_selected {
-            // 🔥 MARQUEE
+        let color = if is_playing {
+            colors::playing()
+        } else if is_selected {
+            colors::selected()
+        } else {
+            colors::text_secondary()
+        };
+
+        let max_name_len = 28; // Reduced for larger font
+        let display_name = if is_selected && name.len() > max_name_len {
             let padded = format!("{}   ", name);
             let extended = padded.repeat(2);
-
-            let width = 20;
 
             extended
                 .chars()
                 .skip(state.marquee_offset % padded.len())
-                .take(width)
+                .take(max_name_len)
                 .collect::<String>()
         } else {
-            // 🔥 TRUNCATE
-            truncate(name, 20)
+            truncate(name, max_name_len)
         };
 
-        let display_text = if is_selected {
-            format!("▶ {}", display_text)
-        } else {
-            format!("  {}", display_text)
-        };
-
-        draw_text(fb, 20, y, &display_text, color);
+        let final_text = format!("{}{}", prefix, display_name);
+        draw_text(fb, padding as i32, y as i32, &final_text, color);
     }
+
+    // =========================
+    // BORDER
+    // =========================
+    draw_modern_border(fb);
+
+    // =========================
+    // STATUS INDICATOR (bottom right)
+    // =========================
+    let status = if state.is_playing { "▶ PLAYING" } else { "⏸ PAUSED" };
+    let status_color = if state.is_playing { colors::playing() } else { colors::paused() };
+    let status_width = status.len() as i32 * 7; // Adjusted for larger font width
+    draw_text(fb, fb.width as i32 - padding as i32 - status_width, (fb.height - 10) as i32, status, status_color);
 }

@@ -26,6 +26,7 @@ use display::render::render;
 
 use image::{ImageBuffer, Rgb};
 use ringbuf::producer::Producer;
+use crate::display::state::RenderState;
 
 // =========================
 // GLOBAL STATE
@@ -37,6 +38,7 @@ struct AppContext {
     control: AudioControl,
     producer: Arc<Mutex<HeapProd<f32>>>,
     device_rate: u32,
+    selected_index: Arc<Mutex<usize>>,  // Track selected/highlighted index separately
 }
 
 fn main() -> Result<()> {
@@ -61,6 +63,7 @@ fn main() -> Result<()> {
         control,
         producer,
         device_rate,
+        selected_index: Arc::new(Mutex::new(0)),  // Initialize with 0
     });
 
     load_saved_state(&context);
@@ -68,7 +71,7 @@ fn main() -> Result<()> {
     start_decoder_thread(context.clone());
     start_auto_save_thread(context.clone());
 
-    // 🔥 DISPLAY THREAD (INI YANG BARU)
+    // DISPLAY THREAD
     start_display_thread(context.clone());
     start_input_thread(context.clone());
 
@@ -86,20 +89,26 @@ fn main() -> Result<()> {
 fn start_display_thread(ctx: Arc<AppContext>) {
     thread::spawn(move || {
         let mut fb = Framebuffer::new(240, 240);
+        let mut render_state = RenderState::new();
 
         loop {
-            let state = build_display_state(&ctx.playlist, &ctx.control);
+            // Get current playing status
+            let is_playing = ctx.control.is_playing();
 
-            render(&mut fb, &state);
+            // Get current selected index
+            let selected = {
+                let selected = ctx.selected_index.lock().unwrap();
+                *selected
+            };
+
+            // Build display state with selected index
+            let state = build_display_state(&ctx.playlist, &ctx.control, is_playing, selected);
+
+            render(&mut fb, &state, &mut render_state);
 
             save_framebuffer(&fb);
 
-            println!(
-                "elapsed: {:.2}, total: {:.2}, progress: {:.3}",
-                state.elapsed_sec, state.total_sec, state.progress
-            );
-
-            thread::sleep(Duration::from_millis(200));
+            thread::sleep(Duration::from_millis(33)); // ~30 FPS
         }
     });
 }
@@ -144,16 +153,29 @@ fn start_input_thread(ctx: Arc<AppContext>) {
 }
 
 fn move_selection(ctx: &Arc<AppContext>, delta: i32) {
-    if let Ok(mut pl) = ctx.playlist.lock() {
-        let new = (pl.current as i32 + delta)
+    // Update selected index for navigation (doesn't affect playing)
+    if let Ok(mut selected) = ctx.selected_index.lock() {
+        let pl = ctx.playlist.lock().unwrap();
+        let new = (*selected as i32 + delta)
             .max(0)
             .min(pl.tracks.len() as i32 - 1) as usize;
-
-        pl.current = new;
+        *selected = new;
     }
 }
 
 fn select_track(ctx: &Arc<AppContext>) {
+    // Get the selected index to play
+    let selected_idx = {
+        let selected = ctx.selected_index.lock().unwrap();
+        *selected
+    };
+
+    // Update playlist current to selected index
+    {
+        let mut pl = ctx.playlist.lock().unwrap();
+        pl.current = selected_idx;
+    }
+
     let path = {
         let pl = ctx.playlist.lock().unwrap();
         match pl.current() {
@@ -162,38 +184,47 @@ fn select_track(ctx: &Arc<AppContext>) {
         }
     };
 
-    // 🔥 RESET DULU
+    // RESET AND PLAY
     ctx.control.reset_for_new_track();
-
-    // 🔥 BARU SET METADATA
     update_track_metadata(ctx, &path);
-
     ctx.control.set_elapsed(0);
-
     ctx.track_version.fetch_add(1, Ordering::Relaxed);
-
     ctx.control.start();
 }
 
 fn toggle_playback(ctx: &Arc<AppContext>) {
     if !ctx.control.is_started() {
-        select_track(ctx); // 🔥 penting: play dari state
+        select_track(ctx); // Play from selected track
     } else {
         ctx.control.toggle_pause();
     }
 }
 
 fn next_track(ctx: &Arc<AppContext>) {
+    // Update playlist current
     if let Ok(mut pl) = ctx.playlist.lock() {
         pl.next();
+    }
+
+    // Update selected index to match playing track
+    if let Ok(mut selected) = ctx.selected_index.lock() {
+        let pl = ctx.playlist.lock().unwrap();
+        *selected = pl.current;
     }
 
     select_track(ctx);
 }
 
 fn prev_track(ctx: &Arc<AppContext>) {
+    // Update playlist current
     if let Ok(mut pl) = ctx.playlist.lock() {
         pl.prev();
+    }
+
+    // Update selected index to match playing track
+    if let Ok(mut selected) = ctx.selected_index.lock() {
+        let pl = ctx.playlist.lock().unwrap();
+        *selected = pl.current;
     }
 
     select_track(ctx);
@@ -230,7 +261,12 @@ fn load_saved_state(ctx: &Arc<AppContext>) {
         if let Ok(mut pl) = ctx.playlist.lock() {
             if let Some(path) = state.track_path {
                 if pl.set_by_path(&path) {
-                    // 🔥 penting: sync metadata
+                    // Sync selected index to the loaded track
+                    if let Ok(mut selected) = ctx.selected_index.lock() {
+                        *selected = pl.current;
+                    }
+
+                    // Sync metadata
                     if let Some(current) = pl.current() {
                         update_track_metadata(ctx, &current);
                     }
@@ -244,7 +280,6 @@ fn update_track_metadata(ctx: &Arc<AppContext>, path: &str) {
     use crate::audio::decoder::probe_only;
 
     if let Ok(info) = probe_only(path) {
-        // 🔥 FIX: gunakan device rate, bukan file rate
         ctx.control.set_sample_rate(ctx.device_rate);
 
         let adjusted_total = if info.sample_rate > 0 {
@@ -272,7 +307,7 @@ fn save_current_state(ctx: &Arc<AppContext>) {
 
 //
 // =========================
-// DECODER THREAD (UNCHANGED CORE)
+// DECODER THREAD
 // =========================
 //
 fn start_decoder_thread(ctx: Arc<AppContext>) {
@@ -303,7 +338,7 @@ fn start_decoder_thread(ctx: Arc<AppContext>) {
                     &path,
                     ctx.device_rate,
                     |sample| {
-                        // 🔥 STOP kalau track berubah
+                        // STOP if track changed
                         if ctx.track_version.load(Ordering::Relaxed) != version_snapshot {
                             return false;
                         }
@@ -333,10 +368,16 @@ fn start_decoder_thread(ctx: Arc<AppContext>) {
                     },
                 );
 
-                // 🔥 kalau selesai & track gak berubah → next
+                // If track finished and didn't change, go to next
                 if ctx.track_version.load(Ordering::Relaxed) == version_snapshot {
                     if let Ok(mut pl) = ctx.playlist.lock() {
                         pl.next();
+                    }
+
+                    // Update selected index to match new playing track
+                    if let Ok(mut selected) = ctx.selected_index.lock() {
+                        let pl = ctx.playlist.lock().unwrap();
+                        *selected = pl.current;
                     }
 
                     ctx.control.reset_for_new_track();
