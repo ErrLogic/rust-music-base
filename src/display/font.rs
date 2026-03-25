@@ -2,7 +2,7 @@ pub const FONT_HEIGHT: usize = 8;  // Increased height
 pub const FONT_WIDTH: usize = 6;   // Increased width
 pub const LETTER_SPACING: i32 = 1;  // Reduced spacing since font is larger
 
-// ASCII subset (32..127) - Larger, more readable characters
+// ASCII subset (32..127)
 pub fn get_char(c: char) -> [u8; 6] {
     match c {
         // Uppercase A-Z (larger)
@@ -40,7 +40,7 @@ pub fn get_char(c: char) -> [u8; 6] {
         'd' => [0x18, 0x24, 0x24, 0x24, 0x3F, 0x00],
         'e' => [0x18, 0x2C, 0x24, 0x24, 0x18, 0x00],
         'f' => [0x04, 0x3F, 0x05, 0x05, 0x04, 0x00],
-        'g' => [0x20, 0x54, 0x54, 0x54, 0x38, 0x00],
+        'g' => [0x18, 0xA4, 0xA4, 0xA4, 0x7C, 0x00],
         'h' => [0x3F, 0x04, 0x04, 0x04, 0x38, 0x00],
         'i' => [0x00, 0x24, 0x3D, 0x20, 0x00, 0x00],
         'j' => [0x20, 0x20, 0x24, 0x1C, 0x04, 0x00],
@@ -107,8 +107,36 @@ pub fn get_char(c: char) -> [u8; 6] {
         '|' => [0x00, 0x3F, 0x00, 0x00, 0x00, 0x00],
         '}' => [0x11, 0x0A, 0x04, 0x00, 0x00, 0x00],
         '~' => [0x04, 0x02, 0x04, 0x00, 0x00, 0x00],
-        '▶' => [0x08, 0x18, 0x38, 0x18, 0x08, 0x00], // Play symbol (larger)
-        '•' => [0x00, 0x1C, 0x1C, 0x00, 0x00, 0x00], // Bullet point (larger)
+
+        // Play symbol - right-pointing triangle (tip points right)
+        '▶' => [
+            0x7F, // 01111111 (rows 0-6) - wide left
+            0x3E, // 00111110 (rows 1-5) - medium
+            0x1C, // 00011100 (rows 2-4) - smaller
+            0x08, // 00001000 (row 3) - tip on right
+            0x00, // Empty
+            0x00, // Empty
+        ],
+
+        // Pause symbol (two vertical bars)
+        '⏸' => [
+            0x3F,
+            0x3F,
+            0x00,
+            0x00,
+            0x3F,
+            0x3F,
+        ],
+
+        // Bullet point (centered)
+        '•' => [
+            0x00, // Empty
+            0x00, // Empty
+            0x1C, // 00011100 (4 pixels)
+            0x1C, // 00011100 (4 pixels)
+            0x00, // Empty
+            0x00, // Empty
+        ],
 
         _ => [0, 0, 0, 0, 0, 0],
     }

@@ -349,8 +349,21 @@ pub fn render(
     // =========================
     // STATUS INDICATOR (bottom right)
     // =========================
-    let status = if state.is_playing { "▶ PLAYING" } else { "⏸ PAUSED" };
+    // Use symbols directly instead of text
+    let status_text = if state.is_playing { "▶" } else { "⏸" };
+    let status_full = if state.is_playing { " PLAYING" } else { " PAUSED" };
     let status_color = if state.is_playing { colors::playing() } else { colors::paused() };
-    let status_width = status.len() as i32 * 7;
-    draw_text(fb, fb.width as i32 - padding as i32 - status_width, (fb.height - 10) as i32, status, status_color);
+
+    // Draw symbol and text separately to ensure symbols render
+    let symbol_width = 7; // Width of symbol character
+    let text_width = status_full.len() as i32 * 7;
+    let total_width = symbol_width + text_width;
+
+    let start_x = fb.width as i32 - padding as i32 - total_width;
+    let status_y = (fb.height - 10) as i32;
+
+    // Draw the symbol
+    draw_text(fb, start_x, status_y, status_text, status_color);
+    // Draw the text after the symbol
+    draw_text(fb, start_x + symbol_width, status_y, status_full, status_color);
 }
